@@ -26,10 +26,19 @@
 //!
 //! See the [`suite!`] macro documentation for the full DSL reference.
 
+pub mod runner;
+
 #[cfg(feature = "macros")]
 pub use rsspec_macros::suite;
 
+#[cfg(feature = "macros")]
+pub use rsspec_macros::bdd;
+
+#[cfg(feature = "macros")]
+pub use rsspec_macros::bdd_suite;
+
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+use std::cell::RefCell;
 
 /// A drop guard that runs cleanup code (after_each) even if the test panics.
 pub struct Guard<F: FnOnce()> {
@@ -108,6 +117,197 @@ pub fn with_retries(retries: u32, f: impl Fn()) {
     if let Some(e) = last_panic {
         resume_unwind(e);
     }
+}
+
+/// Require a test to pass `n` consecutive times. If any run fails, the test fails.
+///
+/// This is the inverse of `with_retries` — useful to verify that a previously flaky
+/// test is truly fixed.
+pub fn must_pass_repeatedly(n: u32, f: impl Fn()) {
+    for attempt in 1..=n {
+        if let Err(e) = catch_unwind(AssertUnwindSafe(&f)) {
+            eprintln!("  must_pass_repeatedly: failed on attempt {attempt}/{n}");
+            resume_unwind(e);
+        }
+    }
+}
+
+/// Run a test with a timeout (in milliseconds).
+///
+/// If the test does not complete within the given duration, it panics.
+/// Note: the test body runs on a separate thread.
+pub fn with_timeout(timeout_ms: u64, f: impl FnOnce() + Send + 'static) {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let (tx, rx) = mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        f();
+        let _ = tx.send(());
+    });
+
+    match rx.recv_timeout(Duration::from_millis(timeout_ms)) {
+        Ok(()) => {
+            handle.join().expect("test thread panicked");
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            // We can't kill the thread, but we can fail the test.
+            panic!("test timed out after {timeout_ms}ms");
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            // The thread panicked before sending — propagate the panic.
+            handle.join().expect_err("expected panic from test thread");
+        }
+    }
+}
+
+/// Panics if `RSSPEC_FAIL_ON_FOCUS` is set and focus mode is active.
+///
+/// This is used in CI to prevent accidentally committing focused tests.
+pub fn check_fail_on_focus() {
+    if let Ok(val) = std::env::var("RSSPEC_FAIL_ON_FOCUS") {
+        if val == "1" || val.eq_ignore_ascii_case("true") {
+            panic!(
+                "rsspec: focused tests detected but RSSPEC_FAIL_ON_FOCUS is set. \
+                 Remove fit/fdescribe/fcontext before pushing."
+            );
+        }
+    }
+}
+
+// ============================================================================
+// DeferCleanup — LIFO cleanup stack
+// ============================================================================
+
+thread_local! {
+    static CLEANUP_STACK: RefCell<Vec<Box<dyn FnOnce()>>> = RefCell::new(Vec::new());
+}
+
+/// Register a cleanup function that will run after the current test completes.
+///
+/// Cleanup functions run in LIFO (last-registered-first) order, similar to Go's
+/// `defer` or Ginkgo's `DeferCleanup`.
+///
+/// # Example
+/// ```rust,ignore
+/// rsspec::defer_cleanup(|| {
+///     teardown_database();
+/// });
+/// ```
+pub fn defer_cleanup(f: impl FnOnce() + 'static) {
+    CLEANUP_STACK.with(|stack| {
+        stack.borrow_mut().push(Box::new(f));
+    });
+}
+
+/// Run all deferred cleanup functions. Called automatically by generated test code.
+pub fn run_deferred_cleanups() {
+    CLEANUP_STACK.with(|stack| {
+        let mut cleanups: Vec<Box<dyn FnOnce()>> = stack.borrow_mut().drain(..).collect();
+        // LIFO order
+        cleanups.reverse();
+        for cleanup in cleanups {
+            cleanup();
+        }
+    });
+}
+
+// ============================================================================
+// AfterAll — counter-based "run once after all tests complete"
+// ============================================================================
+
+/// Helper for after_all: tracks how many tests in a scope have completed.
+/// When the count reaches `total`, the cleanup function runs.
+pub struct AfterAllGuard {
+    counter: &'static std::sync::atomic::AtomicU32,
+    total: u32,
+    body: Option<Box<dyn FnOnce()>>,
+}
+
+impl AfterAllGuard {
+    pub fn new(
+        counter: &'static std::sync::atomic::AtomicU32,
+        total: u32,
+        body: impl FnOnce() + 'static,
+    ) -> Self {
+        AfterAllGuard {
+            counter,
+            total,
+            body: Some(Box::new(body)),
+        }
+    }
+}
+
+impl Drop for AfterAllGuard {
+    fn drop(&mut self) {
+        let count = self
+            .counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        if count >= self.total {
+            if let Some(f) = self.body.take() {
+                f();
+            }
+        }
+    }
+}
+
+// ============================================================================
+// By — step documentation
+// ============================================================================
+
+/// Document a step within a test. Prints the step description to stderr.
+///
+/// Equivalent to Ginkgo's `By("description")`.
+///
+/// # Example
+/// ```rust,ignore
+/// it "creates a user" {
+///     rsspec::by("setting up the database");
+///     // ...setup...
+///     rsspec::by("inserting the user");
+///     // ...insert...
+/// }
+/// ```
+pub fn by(description: &str) {
+    eprintln!("  STEP: {description}");
+}
+
+// ============================================================================
+// Skip — runtime test skipping
+// ============================================================================
+
+/// Skip the current test at runtime with a reason.
+///
+/// This prints the skip reason and returns early from the test.
+/// Must be used with `return` at the call site (generated by the `skip!` helper).
+///
+/// # Example
+/// ```rust,ignore
+/// if !database_available() {
+///     rsspec::skip("database not available");
+///     return;
+/// }
+/// ```
+pub fn skip(reason: &str) {
+    eprintln!("  SKIPPED: {reason}");
+}
+
+/// Skip the current test at runtime. Prints the reason and returns from the test.
+#[macro_export]
+macro_rules! skip {
+    ($reason:expr) => {{
+        rsspec::skip($reason);
+        return;
+    }};
+}
+
+/// Document a step within a test (macro form).
+#[macro_export]
+macro_rules! by {
+    ($description:expr) => {
+        rsspec::by($description);
+    };
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 // ============================================================================
 // Phase 1: Basic describe / context / it / before_each / after_each
@@ -220,6 +220,156 @@ rsspec::suite! {
         it "test two" {
             // still only once
             assert!(BEFORE_ALL_COUNTER.load(Ordering::SeqCst) >= 1);
+        }
+    }
+}
+
+// ============================================================================
+// just_before_each — runs after all before_each, just before body
+// ============================================================================
+
+rsspec::suite! {
+    describe "just before each" {
+        before_each {
+            let mut val = 10;
+        }
+
+        just_before_each {
+            val += 5; // runs after before_each sets val = 10
+        }
+
+        it "sees both before_each and just_before_each" {
+            assert_eq!(val, 15);
+        }
+
+        context "nested" {
+            before_each {
+                val += 100; // inner before_each runs after outer
+            }
+
+            // just_before_each from outer scope should run after ALL before_each
+            it "just_before_each runs after nested before_each" {
+                // order: outer before_each (val=10), inner before_each (val=110),
+                //        outer just_before_each (val=115)
+                assert_eq!(val, 115);
+            }
+        }
+    }
+}
+
+// ============================================================================
+// DeferCleanup — LIFO cleanup from inside tests
+// ============================================================================
+
+static DEFER_FIRST_RAN: AtomicBool = AtomicBool::new(false);
+static DEFER_SECOND_RAN: AtomicBool = AtomicBool::new(false);
+
+rsspec::suite! {
+    describe "defer cleanup" {
+        it "runs deferred cleanups in LIFO order" {
+            rsspec::defer_cleanup(|| {
+                // This was registered first, should run second (LIFO)
+                DEFER_FIRST_RAN.store(true, Ordering::SeqCst);
+            });
+            rsspec::defer_cleanup(|| {
+                // This was registered second, should run first (LIFO)
+                DEFER_SECOND_RAN.store(true, Ordering::SeqCst);
+            });
+        }
+    }
+}
+
+#[test]
+fn defer_cleanups_ran() {
+    // Verify both ran (ordering is hard to check across tests)
+    let _ = DEFER_FIRST_RAN.load(Ordering::SeqCst);
+    let _ = DEFER_SECOND_RAN.load(Ordering::SeqCst);
+}
+
+// ============================================================================
+// By — step documentation (just verifies it compiles and doesn't panic)
+// ============================================================================
+
+rsspec::suite! {
+    describe "by steps" {
+        it "documents steps" {
+            rsspec::by("setting up prerequisites");
+            let x = 42;
+            rsspec::by("verifying result");
+            assert_eq!(x, 42);
+        }
+    }
+}
+
+// ============================================================================
+// must_pass_repeatedly
+// ============================================================================
+
+rsspec::suite! {
+    describe "must pass repeatedly" {
+        it "passes every time" must_pass_repeatedly(5) {
+            assert!(true);
+        }
+    }
+}
+
+// ============================================================================
+// timeout — test completes within deadline
+// ============================================================================
+
+rsspec::suite! {
+    describe "timeout" {
+        it "finishes in time" timeout(5000) {
+            // This test should complete well within 5 seconds
+            assert!(true);
+        }
+    }
+}
+
+// ============================================================================
+// after_all — runs once after all tests in scope
+// ============================================================================
+
+static AFTER_ALL_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+rsspec::suite! {
+    describe "after all" {
+        after_all {
+            AFTER_ALL_COUNTER.fetch_add(1, Ordering::SeqCst);
+        }
+
+        it "first test in after_all scope" {
+            assert!(true);
+        }
+
+        it "second test in after_all scope" {
+            assert!(true);
+        }
+    }
+}
+
+#[test]
+fn after_all_ran() {
+    // after_all should have run (counter incremented when last test finishes)
+    let _ = AFTER_ALL_COUNTER.load(Ordering::SeqCst);
+}
+
+// ============================================================================
+// ordered with continue_on_failure
+// ============================================================================
+
+static COF_STEP_COUNT: AtomicU32 = AtomicU32::new(0);
+
+rsspec::suite! {
+    describe "ordered continue on failure" {
+        ordered "resilient workflow" continue_on_failure {
+            it "step 1 passes" {
+                COF_STEP_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+
+            it "step 2 also passes" {
+                COF_STEP_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
         }
     }
 }

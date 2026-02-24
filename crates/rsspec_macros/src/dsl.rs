@@ -22,6 +22,7 @@ pub enum DslItem {
     Describe(DescribeBlock),
     It(ItBlock),
     BeforeEach(HookBlock),
+    JustBeforeEach(HookBlock),
     AfterEach(HookBlock),
     BeforeAll(HookBlock),
     AfterAll(HookBlock),
@@ -48,6 +49,8 @@ pub struct ItBlock {
     pub pending: bool,
     pub labels: Vec<LitStr>,
     pub retries: Option<u32>,
+    pub must_pass_repeatedly: Option<u32>,
+    pub timeout_ms: Option<u64>,
     pub body: TokenStream,
 }
 
@@ -82,10 +85,11 @@ pub struct TableEntry {
     pub values: TokenStream,
 }
 
-/// `ordered "name" { ... }`
+/// `ordered "name" { ... }` or `ordered "name" continue_on_failure { ... }`
 #[derive(Debug)]
 pub struct OrderedBlock {
     pub name: LitStr,
+    pub continue_on_failure: bool,
     pub items: Vec<DslItem>,
 }
 
@@ -135,6 +139,7 @@ impl Parse for DslItem {
 
             // Hooks
             "before_each" => Ok(DslItem::BeforeEach(parse_hook_block(input)?)),
+            "just_before_each" => Ok(DslItem::JustBeforeEach(parse_hook_block(input)?)),
             "after_each" => Ok(DslItem::AfterEach(parse_hook_block(input)?)),
             "before_all" => Ok(DslItem::BeforeAll(parse_hook_block(input)?)),
             "after_all" => Ok(DslItem::AfterAll(parse_hook_block(input)?)),
@@ -194,6 +199,8 @@ fn parse_it_block(input: ParseStream, focused: bool, pending: bool) -> Result<It
 
     let mut labels = Vec::new();
     let mut retries = None;
+    let mut must_pass_repeatedly = None;
+    let mut timeout_ms = None;
 
     // Parse optional decorators before the body block
     while !input.peek(syn::token::Brace) {
@@ -215,10 +222,25 @@ fn parse_it_block(input: ParseStream, focused: bool, pending: bool) -> Result<It
                 let n: LitInt = content.parse()?;
                 retries = Some(n.base10_parse::<u32>()?);
             }
+            "must_pass_repeatedly" => {
+                let content;
+                parenthesized!(content in input);
+                let n: LitInt = content.parse()?;
+                must_pass_repeatedly = Some(n.base10_parse::<u32>()?);
+            }
+            "timeout" => {
+                let content;
+                parenthesized!(content in input);
+                let n: LitInt = content.parse()?;
+                timeout_ms = Some(n.base10_parse::<u64>()?);
+            }
             other => {
                 return Err(syn::Error::new(
                     decorator.span(),
-                    format!("unknown decorator `{other}`. Expected `labels` or `retries`"),
+                    format!(
+                        "unknown decorator `{other}`. Expected `labels`, `retries`, \
+                         `must_pass_repeatedly`, or `timeout`"
+                    ),
                 ));
             }
         }
@@ -234,6 +256,8 @@ fn parse_it_block(input: ParseStream, focused: bool, pending: bool) -> Result<It
         pending,
         labels,
         retries,
+        must_pass_repeatedly,
+        timeout_ms,
         body,
     })
 }
@@ -305,11 +329,31 @@ fn parse_describe_table(
     })
 }
 
-/// Parse: `"name" { items... }`
+/// Parse: `"name" [continue_on_failure] { items... }`
 fn parse_ordered_block(input: ParseStream) -> Result<OrderedBlock> {
     let name: LitStr = input.parse()?;
+
+    // Check for optional `continue_on_failure` keyword before the brace
+    let continue_on_failure = if input.peek(Ident) {
+        let lookahead = input.fork();
+        let ident: Ident = lookahead.parse()?;
+        if ident == "continue_on_failure" {
+            // Consume the ident from the real stream
+            let _: Ident = input.parse()?;
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
     let content;
     braced!(content in input);
     let items = parse_items(&content)?;
-    Ok(OrderedBlock { name, items })
+    Ok(OrderedBlock {
+        name,
+        continue_on_failure,
+        items,
+    })
 }
