@@ -28,6 +28,14 @@
 
 pub mod runner;
 
+#[cfg(feature = "googletest")]
+pub use googletest;
+
+#[cfg(feature = "googletest")]
+pub mod matchers {
+    pub use googletest::prelude::*;
+}
+
 #[cfg(feature = "macros")]
 pub use rsspec_macros::suite;
 
@@ -156,7 +164,9 @@ pub fn with_timeout(timeout_ms: u64, f: impl FnOnce() + Send + 'static) {
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             // The thread panicked before sending — propagate the panic.
-            handle.join().expect_err("expected panic from test thread");
+            if let Err(e) = handle.join() {
+                std::panic::resume_unwind(e);
+            }
         }
     }
 }

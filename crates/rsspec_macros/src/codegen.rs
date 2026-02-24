@@ -17,25 +17,14 @@ pub fn generate(suite: Suite) -> TokenStream {
         after_each: Vec::new(),
         before_all: Vec::new(),
         after_all_guards: Vec::new(),
+        subject: None,
         focus_mode: has_focus,
+        force_focused: false,
     };
     let items = generate_items(&suite.items, &mut ctx);
 
-    // If focus mode is active, emit a runtime check for RSSPEC_FAIL_ON_FOCUS
-    let fail_on_focus = if has_focus {
-        quote! {
-            #[test]
-            fn rsspec_fail_on_focus_check() {
-                rsspec::check_fail_on_focus();
-            }
-        }
-    } else {
-        quote! {}
-    };
-
     quote! {
         #items
-        #fail_on_focus
     }
 }
 
@@ -50,12 +39,17 @@ struct GenContext {
     just_before_each: Vec<TokenStream>,
     /// Accumulated after_each blocks (outermost first, reversed at use site).
     after_each: Vec<TokenStream>,
-    /// Accumulated before_all blocks.
-    before_all: Vec<TokenStream>,
+    /// Accumulated before_all: (static_ident, body) pairs — statics live at module level.
+    before_all: Vec<(Ident, TokenStream)>,
     /// after_all guards: each entry is (counter_ident, total_tests, body) to emit into each test.
     after_all_guards: Vec<(Ident, usize, TokenStream)>,
+    /// Subject expression — inlined as `let subject = { expr };` after just_before_each.
+    /// Nested subjects override parent (last one wins).
+    subject: Option<TokenStream>,
     /// Whether any node in the entire suite is focused.
     focus_mode: bool,
+    /// Whether all children should be treated as focused (inside fdescribe/fcontext).
+    force_focused: bool,
 }
 
 impl GenContext {
@@ -66,7 +60,9 @@ impl GenContext {
             after_each: self.after_each.clone(),
             before_all: self.before_all.clone(),
             after_all_guards: self.after_all_guards.clone(),
+            subject: self.subject.clone(),
             focus_mode: self.focus_mode,
+            force_focused: self.force_focused,
         }
     }
 }
@@ -75,16 +71,42 @@ impl GenContext {
 // Focus detection — recursive scan
 // ============================================================================
 
-/// Count the total number of test functions that will be generated from this item list.
+/// Count the number of test functions that will actually run (not ignored).
 /// Used for after_all counter tracking.
-fn count_tests(items: &[DslItem]) -> usize {
+fn count_active_tests(items: &[DslItem], focus_mode: bool, force_focused: bool) -> usize {
     items
         .iter()
         .map(|item| match item {
-            DslItem::It(_) => 1,
-            DslItem::Describe(d) => count_tests(&d.items),
-            DslItem::DescribeTable(dt) => dt.entries.len(),
-            DslItem::Ordered(_) => 1, // ordered generates a single test fn
+            DslItem::It(it) => {
+                if it.pending || (focus_mode && !it.focused && !force_focused) {
+                    0
+                } else {
+                    1
+                }
+            }
+            DslItem::Describe(d) => {
+                if d.pending {
+                    0
+                } else {
+                    let child_forced = force_focused || d.focused;
+                    count_active_tests(&d.items, focus_mode, child_forced)
+                }
+            }
+            DslItem::DescribeTable(dt) => {
+                if dt.pending || (focus_mode && !dt.focused && !force_focused) {
+                    0
+                } else {
+                    dt.entries.len()
+                }
+            }
+            DslItem::Ordered(_) => {
+                // ordered generates a single test fn — count 1 if any step would run
+                if focus_mode && !force_focused {
+                    0 // ordered blocks don't support individual focus
+                } else {
+                    1
+                }
+            }
             _ => 0,
         })
         .sum()
@@ -106,6 +128,7 @@ fn suite_has_focus(items: &[DslItem]) -> bool {
 
 fn generate_items(items: &[DslItem], ctx: &mut GenContext) -> TokenStream {
     let mut output = TokenStream::new();
+    let mut nameless_it_counter = 0u32;
 
     for item in items {
         match item {
@@ -118,17 +141,35 @@ fn generate_items(items: &[DslItem], ctx: &mut GenContext) -> TokenStream {
             DslItem::AfterEach(hook) => {
                 ctx.after_each.push(hook.body.clone());
             }
-            DslItem::BeforeAll(hook) => {
-                ctx.before_all.push(hook.body.clone());
+            DslItem::Subject(hook) => {
+                ctx.subject = Some(hook.body.clone());
             }
-            DslItem::AfterAll(_) => {
+            DslItem::BeforeAll(_) | DslItem::AfterAll(_) => {
                 // Handled at describe level — see generate_describe
             }
             DslItem::Describe(block) => {
                 output.extend(generate_describe(block, ctx));
             }
             DslItem::It(block) => {
-                output.extend(generate_it(block, ctx));
+                if block.name.value().is_empty() {
+                    nameless_it_counter += 1;
+                    let named = ItBlock {
+                        name: syn::LitStr::new(
+                            &format!("spec_{nameless_it_counter}"),
+                            block.name.span(),
+                        ),
+                        focused: block.focused,
+                        pending: block.pending,
+                        labels: block.labels.clone(),
+                        retries: block.retries,
+                        must_pass_repeatedly: block.must_pass_repeatedly,
+                        timeout_ms: block.timeout_ms,
+                        body: block.body.clone(),
+                    };
+                    output.extend(generate_it(&named, ctx));
+                } else {
+                    output.extend(generate_it(block, ctx));
+                }
             }
             DslItem::DescribeTable(block) => {
                 output.extend(generate_describe_table(block, ctx));
@@ -152,6 +193,44 @@ fn generate_describe(block: &DescribeBlock, ctx: &GenContext) -> TokenStream {
 
     let mut child_ctx = ctx.child();
 
+    // Propagate focus from fdescribe/fcontext to children
+    if block.focused {
+        child_ctx.force_focused = true;
+    }
+
+    // Scan for before_all hooks at this describe level and set up module-level statics
+    let before_all_bodies: Vec<_> = block
+        .items
+        .iter()
+        .filter_map(|item| {
+            if let DslItem::BeforeAll(hook) = item {
+                Some(hook.body.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    for (i, body) in before_all_bodies.into_iter().enumerate() {
+        let static_ident = Ident::new(
+            &format!("BEFORE_ALL_{}_{i}", mod_name.to_uppercase()),
+            Span::call_site(),
+        );
+        child_ctx.before_all.push((static_ident, body));
+    }
+
+    // Generate static Once for before_all added at this scope
+    let before_all_statics: Vec<TokenStream> = child_ctx
+        .before_all
+        .iter()
+        .skip(ctx.before_all.len()) // only new ones from this scope
+        .map(|(static_ident, _)| {
+            quote! {
+                static #static_ident: std::sync::Once = std::sync::Once::new();
+            }
+        })
+        .collect();
+
     // Scan for after_all hooks at this describe level and set up counter-based guards
     let after_all_bodies: Vec<_> = block
         .items
@@ -166,7 +245,7 @@ fn generate_describe(block: &DescribeBlock, ctx: &GenContext) -> TokenStream {
         .collect();
 
     if !after_all_bodies.is_empty() {
-        let total = count_tests(&block.items);
+        let total = count_active_tests(&block.items, child_ctx.focus_mode, child_ctx.force_focused);
         for (i, body) in after_all_bodies.into_iter().enumerate() {
             let counter_ident = Ident::new(
                 &format!("AFTER_ALL_COUNTER_{}_{i}", mod_name.to_uppercase()),
@@ -197,6 +276,7 @@ fn generate_describe(block: &DescribeBlock, ctx: &GenContext) -> TokenStream {
         quote! {
             mod #mod_ident {
                 use super::*;
+                #(#before_all_statics)*
                 #(#after_all_statics)*
                 #inner
             }
@@ -206,6 +286,7 @@ fn generate_describe(block: &DescribeBlock, ctx: &GenContext) -> TokenStream {
         quote! {
             mod #mod_ident {
                 use super::*;
+                #(#before_all_statics)*
                 #(#after_all_statics)*
                 #inner
             }
@@ -216,6 +297,7 @@ fn generate_describe(block: &DescribeBlock, ctx: &GenContext) -> TokenStream {
 /// Generate items where all `it` blocks are forced to be pending (ignored).
 fn generate_items_pending(items: &[DslItem], ctx: &mut GenContext) -> TokenStream {
     let mut output = TokenStream::new();
+    let mut nameless_it_counter = 0u32;
 
     for item in items {
         match item {
@@ -228,11 +310,11 @@ fn generate_items_pending(items: &[DslItem], ctx: &mut GenContext) -> TokenStrea
             DslItem::AfterEach(hook) => {
                 ctx.after_each.push(hook.body.clone());
             }
-            DslItem::BeforeAll(hook) => {
-                ctx.before_all.push(hook.body.clone());
+            DslItem::Subject(hook) => {
+                ctx.subject = Some(hook.body.clone());
             }
-            DslItem::AfterAll(_) => {
-                // In pending mode, after_all is irrelevant
+            DslItem::BeforeAll(_) | DslItem::AfterAll(_) => {
+                // In pending mode, these are irrelevant
             }
             DslItem::Describe(block) => {
                 let mod_name = sanitize_name(&block.name.value());
@@ -247,9 +329,18 @@ fn generate_items_pending(items: &[DslItem], ctx: &mut GenContext) -> TokenStrea
                 });
             }
             DslItem::It(block) => {
-                // Force pending
+                // Force pending; handle nameless it
+                let name = if block.name.value().is_empty() {
+                    nameless_it_counter += 1;
+                    syn::LitStr::new(
+                        &format!("spec_{nameless_it_counter}"),
+                        block.name.span(),
+                    )
+                } else {
+                    block.name.clone()
+                };
                 let forced = ItBlock {
-                    name: block.name.clone(),
+                    name,
                     focused: false,
                     pending: true,
                     labels: block.labels.clone(),
@@ -291,9 +382,10 @@ fn generate_it(block: &ItBlock, ctx: &GenContext) -> TokenStream {
     let fn_ident = Ident::new(&fn_name, Span::call_site());
     let body = &block.body;
 
-    // Determine test attribute
+    // Determine test attribute (force_focused propagates from fdescribe/fcontext)
+    let effectively_focused = block.focused || ctx.force_focused;
     let is_ignored = block.pending
-        || (ctx.focus_mode && !block.focused);
+        || (ctx.focus_mode && !effectively_focused);
 
     let test_attr = if is_ignored {
         quote! { #[test] #[ignore] }
@@ -307,83 +399,97 @@ fn generate_it(block: &ItBlock, ctx: &GenContext) -> TokenStream {
     // Inline just_before_each (outermost first, runs after all before_each)
     let just_before_each_code: Vec<_> = ctx.just_before_each.iter().collect();
 
-    // Inline after_each via Guard (innermost first for proper cleanup order)
-    let after_each_guards: Vec<TokenStream> = ctx
-        .after_each
-        .iter()
-        .rev()
-        .enumerate()
-        .map(|(i, after_body)| {
-            let guard_name = Ident::new(&format!("_after_each_guard_{i}"), Span::call_site());
-            quote! {
-                let #guard_name = rsspec::Guard::new(|| { #after_body });
-            }
-        })
-        .collect();
+    // after_each bodies (innermost first for proper cleanup order)
+    let after_each_bodies: Vec<_> = ctx.after_each.iter().rev().collect();
 
-    // before_all via OnceLock
+    // before_all via module-level Once statics
     let before_all_code: Vec<TokenStream> = ctx
         .before_all
         .iter()
-        .enumerate()
-        .map(|(i, all_body)| {
-            let lock_name = Ident::new(&format!("BEFORE_ALL_{i}"), Span::call_site());
+        .map(|(static_ident, all_body)| {
             quote! {
-                static #lock_name: std::sync::Once = std::sync::Once::new();
-                #lock_name.call_once(|| { #all_body });
+                #static_ident.call_once(|| { #all_body });
             }
         })
         .collect();
 
-    // after_all via counter-based guard
-    let after_all_guards_code: Vec<TokenStream> = ctx
-        .after_all_guards
-        .iter()
-        .enumerate()
-        .map(|(i, (counter_ident, total, all_body))| {
-            let guard_name =
-                Ident::new(&format!("_after_all_guard_{i}"), Span::call_site());
-            let total_u32 = *total as u32;
-            quote! {
-                let #guard_name = rsspec::AfterAllGuard::new(
-                    &#counter_ident,
-                    #total_u32,
-                    || { #all_body },
-                );
-            }
-        })
-        .collect();
-
-    // Label filtering
-    let label_check = if block.labels.is_empty() {
-        quote! {}
+    // after_all via counter-based guard (only for non-ignored tests)
+    let after_all_guards_code: Vec<TokenStream> = if is_ignored {
+        Vec::new()
     } else {
-        let label_strs: Vec<_> = block.labels.iter().collect();
-        quote! {
-            if !rsspec::check_labels(&[#(#label_strs),*]) {
-                println!("  skipped (labels don't match filter)");
-                return;
-            }
+        ctx.after_all_guards
+            .iter()
+            .enumerate()
+            .map(|(i, (counter_ident, total, all_body))| {
+                let guard_name =
+                    Ident::new(&format!("_after_all_guard_{i}"), Span::call_site());
+                let total_u32 = *total as u32;
+                quote! {
+                    let #guard_name = rsspec::AfterAllGuard::new(
+                        &#counter_ident,
+                        #total_u32,
+                        || { #all_body },
+                    );
+                }
+            })
+            .collect()
+    };
+
+    // Label filtering — always emit, even for unlabeled tests
+    let label_strs: Vec<_> = block.labels.iter().collect();
+    let label_check = quote! {
+        if !rsspec::check_labels(&[#(#label_strs),*]) {
+            return;
         }
     };
 
-    // Core test body (before_each + just_before_each + after_each guards + body)
-    let core_body = quote! {
-        #(#before_each_code)*
-        #(#just_before_each_code)*
-        #(#after_each_guards)*
-        #body
+    // Fail-on-focus check (only for focused tests, prevents accidental commits)
+    let focus_check = if effectively_focused && ctx.focus_mode {
+        quote! { rsspec::check_fail_on_focus(); }
+    } else {
+        quote! {}
+    };
+
+    // Inline subject (if any) as `let subject = { expr };`
+    let subject_code = ctx.subject.as_ref().map(|expr| {
+        quote! { let subject = { #expr }; }
+    });
+
+    // Build the inner body: before_each + just_before_each + subject + body [+ after_each]
+    // When after_each exists, use catch_unwind to guarantee after_each runs even on panic
+    let inner_body = if ctx.after_each.is_empty() {
+        quote! {
+            #(#before_each_code)*
+            #(#just_before_each_code)*
+            #subject_code
+            #body
+        }
+    } else {
+        quote! {
+            #(#before_each_code)*
+            #(#just_before_each_code)*
+            #subject_code
+            let _rsspec_body_result = std::panic::catch_unwind(
+                std::panic::AssertUnwindSafe(|| { #body })
+            );
+            // after_each runs unconditionally (innermost first)
+            #(#after_each_bodies)*
+            // resume body panic if any
+            if let Err(_rsspec_panic) = _rsspec_body_result {
+                std::panic::resume_unwind(_rsspec_panic);
+            }
+        }
     };
 
     // Wrap with retries if specified
     let with_retries = if let Some(n) = block.retries {
         quote! {
             rsspec::with_retries(#n, || {
-                #core_body
+                #inner_body
             });
         }
     } else {
-        core_body
+        inner_body
     };
 
     // Wrap with must_pass_repeatedly if specified
@@ -415,6 +521,7 @@ fn generate_it(block: &ItBlock, ctx: &GenContext) -> TokenStream {
             let _rsspec_defer_guard = rsspec::Guard::new(|| {
                 rsspec::run_deferred_cleanups();
             });
+            #focus_check
             #(#before_all_code)*
             #(#after_all_guards_code)*
             #label_check
@@ -431,6 +538,9 @@ fn generate_describe_table(block: &DescribeTableBlock, ctx: &GenContext) -> Toke
     let mod_name = sanitize_name(&block.name.value());
     let mod_ident = Ident::new(&mod_name, Span::call_site());
 
+    let effectively_focused = block.focused || ctx.force_focused;
+    let is_ignored = block.pending || (ctx.focus_mode && !effectively_focused);
+
     let mut tests = TokenStream::new();
 
     for (i, entry) in block.entries.iter().enumerate() {
@@ -441,7 +551,6 @@ fn generate_describe_table(block: &DescribeTableBlock, ctx: &GenContext) -> Toke
         };
         let fn_ident = Ident::new(&entry_name, Span::call_site());
 
-        let is_ignored = block.pending || (ctx.focus_mode && !block.focused);
         let test_attr = if is_ignored {
             quote! { #[test] #[ignore] }
         } else {
@@ -470,29 +579,82 @@ fn generate_describe_table(block: &DescribeTableBlock, ctx: &GenContext) -> Toke
         // Inline hooks
         let before_each_code: Vec<_> = ctx.before_each.iter().collect();
         let just_before_each_code: Vec<_> = ctx.just_before_each.iter().collect();
-        let after_each_guards: Vec<TokenStream> = ctx
-            .after_each
+        let after_each_bodies: Vec<_> = ctx.after_each.iter().rev().collect();
+
+        // before_all
+        let before_all_code: Vec<TokenStream> = ctx
+            .before_all
             .iter()
-            .rev()
-            .enumerate()
-            .map(|(i, after_body)| {
-                let guard_name =
-                    Ident::new(&format!("_after_each_guard_{i}"), Span::call_site());
-                quote! {
-                    let #guard_name = rsspec::Guard::new(|| { #after_body });
-                }
+            .map(|(static_ident, all_body)| {
+                quote! { #static_ident.call_once(|| { #all_body }); }
             })
             .collect();
+
+        // after_all (only for non-ignored tests)
+        let after_all_guards_code: Vec<TokenStream> = if is_ignored {
+            Vec::new()
+        } else {
+            ctx.after_all_guards
+                .iter()
+                .enumerate()
+                .map(|(j, (counter_ident, total, all_body))| {
+                    let guard_name =
+                        Ident::new(&format!("_after_all_guard_{j}"), Span::call_site());
+                    let total_u32 = *total as u32;
+                    quote! {
+                        let #guard_name = rsspec::AfterAllGuard::new(
+                            &#counter_ident, #total_u32, || { #all_body },
+                        );
+                    }
+                })
+                .collect()
+        };
+
+        // Label check
+        let label_check = quote! {
+            if !rsspec::check_labels(&[]) { return; }
+        };
+
+        // Inline subject
+        let subject_code = ctx.subject.as_ref().map(|expr| {
+            quote! { let subject = { #expr }; }
+        });
+
+        // Build inner body with catch_unwind for after_each
+        let inner_body = if ctx.after_each.is_empty() {
+            quote! {
+                #(#before_each_code)*
+                #(#just_before_each_code)*
+                #subject_code
+                #body
+            }
+        } else {
+            quote! {
+                #(#before_each_code)*
+                #(#just_before_each_code)*
+                #subject_code
+                let _rsspec_body_result = std::panic::catch_unwind(
+                    std::panic::AssertUnwindSafe(|| { #body })
+                );
+                #(#after_each_bodies)*
+                if let Err(_rsspec_panic) = _rsspec_body_result {
+                    std::panic::resume_unwind(_rsspec_panic);
+                }
+            }
+        };
 
         tests.extend(quote! {
             #test_attr
             fn #fn_ident() {
+                let _rsspec_defer_guard = rsspec::Guard::new(|| {
+                    rsspec::run_deferred_cleanups();
+                });
+                #(#before_all_code)*
+                #(#after_all_guards_code)*
+                #label_check
                 let _rsspec_entry: (#(#param_types),*,) = (#entry_values,);
                 #(#param_bindings)*
-                #(#before_each_code)*
-                #(#just_before_each_code)*
-                #(#after_each_guards)*
-                #body
+                #inner_body
             }
         });
     }
@@ -513,6 +675,38 @@ fn generate_ordered(block: &OrderedBlock, ctx: &GenContext) -> TokenStream {
     let fn_name = sanitize_name(&block.name.value());
     let fn_ident = Ident::new(&fn_name, Span::call_site());
 
+    // before_all
+    let before_all_code: Vec<TokenStream> = ctx
+        .before_all
+        .iter()
+        .map(|(static_ident, all_body)| {
+            quote! { #static_ident.call_once(|| { #all_body }); }
+        })
+        .collect();
+
+    // after_all
+    let after_all_guards_code: Vec<TokenStream> = ctx
+        .after_all_guards
+        .iter()
+        .enumerate()
+        .map(|(i, (counter_ident, total, all_body))| {
+            let guard_name = Ident::new(&format!("_after_all_guard_{i}"), Span::call_site());
+            let total_u32 = *total as u32;
+            quote! {
+                let #guard_name = rsspec::AfterAllGuard::new(
+                    &#counter_ident, #total_u32, || { #all_body },
+                );
+            }
+        })
+        .collect();
+
+    let after_each_bodies: Vec<_> = ctx.after_each.iter().rev().collect();
+
+    // Inline subject
+    let subject_code = ctx.subject.as_ref().map(|expr| {
+        quote! { let subject = { #expr }; }
+    });
+
     // Collect all `it` blocks in order. Run them sequentially in one test function.
     let mut steps = Vec::new();
     for item in &block.items {
@@ -525,14 +719,19 @@ fn generate_ordered(block: &OrderedBlock, ctx: &GenContext) -> TokenStream {
                 println!("  step: {}", #step_name);
                 #(#before_each_code)*
                 #(#just_before_each_code)*
+                #subject_code
                 #body
             });
         }
     }
 
-    if block.continue_on_failure {
+    // Label check
+    let label_check = quote! {
+        if !rsspec::check_labels(&[]) { return; }
+    };
+
+    let ordered_body = if block.continue_on_failure {
         let total_steps = steps.len();
-        // Each step runs in catch_unwind; failures are collected; panic at end if any failed.
         let catch_steps: Vec<TokenStream> = steps
             .into_iter()
             .map(|step| {
@@ -547,26 +746,45 @@ fn generate_ordered(block: &OrderedBlock, ctx: &GenContext) -> TokenStream {
             .collect();
 
         quote! {
-            #[test]
-            fn #fn_ident() {
-                let mut _rsspec_failures: Vec<Box<dyn std::any::Any + Send>> = Vec::new();
-                #(#catch_steps)*
-                if !_rsspec_failures.is_empty() {
-                    panic!(
-                        "{} of {} ordered steps failed",
-                        _rsspec_failures.len(),
-                        #total_steps,
-                    );
-                }
+            let mut _rsspec_failures: Vec<Box<dyn std::any::Any + Send>> = Vec::new();
+            #(#catch_steps)*
+            if !_rsspec_failures.is_empty() {
+                panic!(
+                    "{} of {} ordered steps failed",
+                    _rsspec_failures.len(),
+                    #total_steps,
+                );
             }
         }
     } else {
-        // Default: fail-fast (sequential, stop on first failure)
+        quote! { #(#steps)* }
+    };
+
+    // Wrap ordered body with after_each via catch_unwind
+    let body_with_after = if ctx.after_each.is_empty() {
+        ordered_body
+    } else {
         quote! {
-            #[test]
-            fn #fn_ident() {
-                #(#steps)*
+            let _rsspec_body_result = std::panic::catch_unwind(
+                std::panic::AssertUnwindSafe(|| { #ordered_body })
+            );
+            #(#after_each_bodies)*
+            if let Err(_rsspec_panic) = _rsspec_body_result {
+                std::panic::resume_unwind(_rsspec_panic);
             }
+        }
+    };
+
+    quote! {
+        #[test]
+        fn #fn_ident() {
+            let _rsspec_defer_guard = rsspec::Guard::new(|| {
+                rsspec::run_deferred_cleanups();
+            });
+            #(#before_all_code)*
+            #(#after_all_guards_code)*
+            #label_check
+            #body_with_after
         }
     }
 }
@@ -577,7 +795,7 @@ fn generate_ordered(block: &OrderedBlock, ctx: &GenContext) -> TokenStream {
 
 /// Generate a `fn main()` that builds a test tree and runs it with the BDD runner.
 pub fn generate_bdd(suite: Suite) -> TokenStream {
-    let tree_nodes = generate_bdd_items(&suite.items);
+    let tree_nodes = generate_bdd_items(&suite.items, &BddGenContext::new());
 
     quote! {
         fn main() {
@@ -594,7 +812,7 @@ pub fn generate_bdd(suite: Suite) -> TokenStream {
 
 /// Generate just the test tree (no `fn main()`), for combining multiple suites.
 pub fn generate_bdd_suite(suite: Suite) -> TokenStream {
-    let tree_nodes = generate_bdd_items(&suite.items);
+    let tree_nodes = generate_bdd_items(&suite.items, &BddGenContext::new());
 
     quote! {
         {
@@ -604,84 +822,117 @@ pub fn generate_bdd_suite(suite: Suite) -> TokenStream {
     }
 }
 
+/// BDD generation context — tracks inherited hooks for the BDD runner path.
+struct BddGenContext {
+    before_each: Vec<TokenStream>,
+    just_before_each: Vec<TokenStream>,
+    after_each: Vec<TokenStream>,
+    subject: Option<TokenStream>,
+}
+
+impl BddGenContext {
+    fn new() -> Self {
+        BddGenContext {
+            before_each: Vec::new(),
+            just_before_each: Vec::new(),
+            after_each: Vec::new(),
+            subject: None,
+        }
+    }
+
+    fn child(&self) -> Self {
+        BddGenContext {
+            before_each: self.before_each.clone(),
+            just_before_each: self.just_before_each.clone(),
+            after_each: self.after_each.clone(),
+            subject: self.subject.clone(),
+        }
+    }
+}
+
 /// Generate `TestNode` constructors for a list of DSL items.
-fn generate_bdd_items(items: &[DslItem]) -> Vec<TokenStream> {
-    let mut before_each_bodies: Vec<TokenStream> = Vec::new();
-    let mut just_before_each_bodies: Vec<TokenStream> = Vec::new();
-    let mut after_each_bodies: Vec<TokenStream> = Vec::new();
+fn generate_bdd_items(items: &[DslItem], ctx: &BddGenContext) -> Vec<TokenStream> {
+    let mut local_ctx = ctx.child();
     let mut nodes = Vec::new();
+    let mut nameless_it_counter = 0u32;
 
     for item in items {
         match item {
             DslItem::BeforeEach(hook) => {
-                before_each_bodies.push(hook.body.clone());
+                local_ctx.before_each.push(hook.body.clone());
             }
             DslItem::JustBeforeEach(hook) => {
-                just_before_each_bodies.push(hook.body.clone());
+                local_ctx.just_before_each.push(hook.body.clone());
             }
             DslItem::AfterEach(hook) => {
-                after_each_bodies.push(hook.body.clone());
+                local_ctx.after_each.push(hook.body.clone());
+            }
+            DslItem::Subject(hook) => {
+                local_ctx.subject = Some(hook.body.clone());
             }
             DslItem::BeforeAll(_) | DslItem::AfterAll(_) => {
-                // TODO: before_all/after_all in BDD mode
+                // before_all/after_all not yet supported in BDD mode
+                // (would need module-level statics, which don't fit closures well)
             }
             DslItem::Describe(block) => {
                 let name = block.name.value();
                 if block.pending {
-                    // All children become pending
                     let child_nodes = generate_bdd_items_pending(&block.items);
                     nodes.push(quote! {
                         rsspec::runner::TestNode::describe(#name, vec![#(#child_nodes),*])
                     });
                 } else {
-                    let child_nodes = generate_bdd_items(&block.items);
+                    // Pass accumulated hooks to children
+                    let child_nodes = generate_bdd_items(&block.items, &local_ctx);
                     nodes.push(quote! {
                         rsspec::runner::TestNode::describe(#name, vec![#(#child_nodes),*])
                     });
                 }
             }
             DslItem::It(block) => {
-                let name = block.name.value();
+                let name = if block.name.value().is_empty() {
+                    nameless_it_counter += 1;
+                    format!("spec {nameless_it_counter}")
+                } else {
+                    block.name.value()
+                };
                 let body = &block.body;
-                let be = &before_each_bodies;
-                let jbe = &just_before_each_bodies;
-                let ae = &after_each_bodies;
+                let be = &local_ctx.before_each;
+                let jbe = &local_ctx.just_before_each;
+                let ae_bodies: Vec<_> = local_ctx.after_each.iter().rev().collect();
+                let subject_code = local_ctx.subject.as_ref().map(|expr| {
+                    quote! { let subject = { #expr }; }
+                });
 
-                let after_guards: Vec<TokenStream> = ae
-                    .iter()
-                    .rev()
-                    .enumerate()
-                    .map(|(i, ab)| {
-                        let guard_name =
-                            Ident::new(&format!("_after_each_guard_{i}"), Span::call_site());
-                        quote! {
-                            let #guard_name = rsspec::Guard::new(|| { #ab });
-                        }
-                    })
-                    .collect();
-
-                let constructor = if block.pending {
+                // Use catch_unwind pattern for after_each (same as suite! path)
+                let it_body = if local_ctx.after_each.is_empty() {
                     quote! {
-                        rsspec::runner::TestNode::xit(#name, || {})
-                    }
-                } else if block.focused {
-                    quote! {
-                        rsspec::runner::TestNode::fit(#name, || {
-                            #(#be)*
-                            #(#jbe)*
-                            #(#after_guards)*
-                            #body
-                        })
+                        #(#be)*
+                        #(#jbe)*
+                        #subject_code
+                        #body
                     }
                 } else {
                     quote! {
-                        rsspec::runner::TestNode::it(#name, || {
-                            #(#be)*
-                            #(#jbe)*
-                            #(#after_guards)*
-                            #body
-                        })
+                        #(#be)*
+                        #(#jbe)*
+                        #subject_code
+                        let _rsspec_body_result = std::panic::catch_unwind(
+                            std::panic::AssertUnwindSafe(|| { #body })
+                        );
+                        #(#ae_bodies)*
+                        if let Err(_rsspec_panic) = _rsspec_body_result {
+                            std::panic::resume_unwind(_rsspec_panic);
+                        }
                     }
+                };
+
+                let constructor = if block.pending {
+                    quote! { rsspec::runner::TestNode::xit(#name, || {}) }
+                } else if block.focused {
+                    quote! { rsspec::runner::TestNode::fit(#name, || { #it_body }) }
+                } else {
+                    quote! { rsspec::runner::TestNode::it(#name, || { #it_body }) }
                 };
 
                 nodes.push(constructor);
@@ -714,23 +965,43 @@ fn generate_bdd_items(items: &[DslItem]) -> Vec<TokenStream> {
                         .collect();
 
                     let body = &block.body;
-                    let be = &before_each_bodies;
-                    let jbe = &just_before_each_bodies;
+                    let be = &local_ctx.before_each;
+                    let jbe = &local_ctx.just_before_each;
+                    let ae_bodies: Vec<_> = local_ctx.after_each.iter().rev().collect();
+                    let subject_code = local_ctx.subject.as_ref().map(|expr| {
+                        quote! { let subject = { #expr }; }
+                    });
 
-                    let constructor = if block.pending {
+                    let entry_body = if local_ctx.after_each.is_empty() {
                         quote! {
-                            rsspec::runner::TestNode::xit(#entry_name, || {})
+                            let _rsspec_entry: (#(#param_types),*,) = (#entry_values,);
+                            #(#param_bindings)*
+                            #(#be)*
+                            #(#jbe)*
+                            #subject_code
+                            #body
                         }
                     } else {
                         quote! {
-                            rsspec::runner::TestNode::it(#entry_name, || {
-                                let _rsspec_entry: (#(#param_types),*,) = (#entry_values,);
-                                #(#param_bindings)*
-                                #(#be)*
-                                #(#jbe)*
-                                #body
-                            })
+                            let _rsspec_entry: (#(#param_types),*,) = (#entry_values,);
+                            #(#param_bindings)*
+                            #(#be)*
+                            #(#jbe)*
+                            #subject_code
+                            let _rsspec_body_result = std::panic::catch_unwind(
+                                std::panic::AssertUnwindSafe(|| { #body })
+                            );
+                            #(#ae_bodies)*
+                            if let Err(_rsspec_panic) = _rsspec_body_result {
+                                std::panic::resume_unwind(_rsspec_panic);
+                            }
                         }
+                    };
+
+                    let constructor = if block.pending {
+                        quote! { rsspec::runner::TestNode::xit(#entry_name, || {}) }
+                    } else {
+                        quote! { rsspec::runner::TestNode::it(#entry_name, || { #entry_body }) }
                     };
 
                     entry_nodes.push(constructor);
@@ -742,7 +1013,11 @@ fn generate_bdd_items(items: &[DslItem]) -> Vec<TokenStream> {
             }
             DslItem::Ordered(block) => {
                 let name = block.name.value();
-                // Ordered becomes a single It node that runs all steps
+                let be = &local_ctx.before_each;
+                let jbe = &local_ctx.just_before_each;
+                let subject_code = local_ctx.subject.as_ref().map(|expr| {
+                    quote! { let subject = { #expr }; }
+                });
                 let mut step_bodies = Vec::new();
                 for item in &block.items {
                     if let DslItem::It(it_block) = item {
@@ -750,6 +1025,9 @@ fn generate_bdd_items(items: &[DslItem]) -> Vec<TokenStream> {
                         let body = &it_block.body;
                         step_bodies.push(quote! {
                             rsspec::by(#step_name);
+                            #(#be)*
+                            #(#jbe)*
+                            #subject_code
                             #body
                         });
                     }

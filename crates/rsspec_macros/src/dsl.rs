@@ -2,7 +2,7 @@
 //!
 //! Parses the Ginkgo-inspired DSL syntax into a structured AST.
 
-use proc_macro2::TokenStream;
+use proc_macro2::{Span, TokenStream};
 use syn::parse::{Parse, ParseStream};
 use syn::{braced, bracketed, parenthesized, Ident, LitInt, LitStr, Result, Token, Type};
 
@@ -26,6 +26,7 @@ pub enum DslItem {
     AfterEach(HookBlock),
     BeforeAll(HookBlock),
     AfterAll(HookBlock),
+    Subject(HookBlock),
     DescribeTable(DescribeTableBlock),
     Ordered(OrderedBlock),
 }
@@ -143,6 +144,7 @@ impl Parse for DslItem {
             "after_each" => Ok(DslItem::AfterEach(parse_hook_block(input)?)),
             "before_all" => Ok(DslItem::BeforeAll(parse_hook_block(input)?)),
             "after_all" => Ok(DslItem::AfterAll(parse_hook_block(input)?)),
+            "subject" => Ok(DslItem::Subject(parse_hook_block(input)?)),
 
             // Table-driven
             "describe_table" => Ok(DslItem::DescribeTable(parse_describe_table(
@@ -163,7 +165,7 @@ impl Parse for DslItem {
                 format!(
                     "unknown DSL keyword `{name}`. Expected one of: \
                      describe, context, when, it, specify, before_each, after_each, \
-                     before_all, after_all, describe_table, ordered \
+                     before_all, after_all, subject, describe_table, ordered \
                      (with optional f/x/p prefix for focus/pending)"
                 ),
             )),
@@ -193,9 +195,15 @@ fn parse_describe_block(
     })
 }
 
-/// Parse: `"name" [labels(...)] [retries(N)] { body }`
+/// Parse: `["name"] [labels(...)] [retries(N)] { body }`
+/// Name is optional — `it { body }` generates an auto-named spec.
 fn parse_it_block(input: ParseStream, focused: bool, pending: bool) -> Result<ItBlock> {
-    let name: LitStr = input.parse()?;
+    let name = if input.peek(LitStr) {
+        input.parse::<LitStr>()?
+    } else {
+        // Nameless it — will get a sequential name in codegen
+        LitStr::new("", Span::call_site())
+    };
 
     let mut labels = Vec::new();
     let mut retries = None;
