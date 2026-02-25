@@ -10,7 +10,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dev-dependencies]
-rsspec = "0.1"
+rsspec = "0.2"
 
 [[test]]
 name = "my_tests"
@@ -48,6 +48,26 @@ Calculator
 PASS
 2 passed (0.001s)
 ```
+
+### Using with `#[test]` functions
+
+If you want to embed rsspec specs inside regular `#[test]` functions (no `harness = false` needed), use `run_inline`:
+
+```rust
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn calculator_spec() {
+        rsspec::run_inline(|ctx| {
+            ctx.describe("Calculator", |ctx| {
+                ctx.it("adds", || { assert_eq!(2 + 3, 5); });
+            });
+        });
+    }
+}
+```
+
+`run_inline` does not parse command-line args (avoiding conflicts with `cargo test`'s own filters) and panics on failure instead of calling `process::exit`.
 
 ## API Reference
 
@@ -278,7 +298,7 @@ Enable the `googletest` feature for composable matchers:
 
 ```toml
 [dev-dependencies]
-rsspec = { version = "0.1", features = ["googletest"] }
+rsspec = { version = "0.2", features = ["googletest"] }
 ```
 
 ```rust

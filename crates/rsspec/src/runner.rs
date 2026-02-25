@@ -18,13 +18,13 @@ use std::time::Instant;
 // ============================================================================
 
 /// A step in an ordered test sequence.
-pub struct OrderedStep {
+pub(crate) struct OrderedStep {
     pub name: String,
     pub body: Box<dyn Fn()>,
 }
 
 /// A node in the BDD test tree.
-pub enum TestNode {
+pub(crate) enum TestNode {
     /// A describe/context/when container.
     Describe {
         name: String,
@@ -58,9 +58,9 @@ pub enum TestNode {
     },
 }
 
+#[cfg(test)]
 impl TestNode {
-    /// Create a describe/context container with child nodes.
-    pub fn describe(name: impl Into<String>, children: Vec<TestNode>) -> Self {
+    fn describe(name: impl Into<String>, children: Vec<TestNode>) -> Self {
         TestNode::Describe {
             name: name.into(),
             focused: false,
@@ -75,8 +75,47 @@ impl TestNode {
         }
     }
 
-    /// Create a normal test case.
-    pub fn it(name: impl Into<String>, f: impl Fn() + 'static) -> Self {
+    fn describe_with_hooks(
+        name: impl Into<String>,
+        before_all: Vec<Box<dyn Fn()>>,
+        after_all: Vec<Box<dyn Fn()>>,
+        children: Vec<TestNode>,
+    ) -> Self {
+        TestNode::Describe {
+            name: name.into(),
+            focused: false,
+            pending: false,
+            labels: Vec::new(),
+            before_each: Vec::new(),
+            after_each: Vec::new(),
+            before_all,
+            after_all,
+            just_before_each: Vec::new(),
+            children,
+        }
+    }
+
+    fn describe_with_each_hooks(
+        name: impl Into<String>,
+        before_each: Vec<Box<dyn Fn()>>,
+        after_each: Vec<Box<dyn Fn()>>,
+        children: Vec<TestNode>,
+    ) -> Self {
+        TestNode::Describe {
+            name: name.into(),
+            focused: false,
+            pending: false,
+            labels: Vec::new(),
+            before_each,
+            after_each,
+            before_all: Vec::new(),
+            after_all: Vec::new(),
+            just_before_each: Vec::new(),
+            children,
+        }
+    }
+
+    fn it(name: impl Into<String>, f: impl Fn() + 'static) -> Self {
         TestNode::It {
             name: name.into(),
             focused: false,
@@ -89,8 +128,7 @@ impl TestNode {
         }
     }
 
-    /// Create a focused test case — when any node is focused, only focused nodes run.
-    pub fn fit(name: impl Into<String>, f: impl Fn() + 'static) -> Self {
+    fn fit(name: impl Into<String>, f: impl Fn() + 'static) -> Self {
         TestNode::It {
             name: name.into(),
             focused: true,
@@ -102,19 +140,20 @@ impl TestNode {
             test_fn: Box::new(f),
         }
     }
+}
 
-    /// Create a pending (skipped) test case.
-    pub fn xit(name: impl Into<String>, f: impl Fn() + 'static) -> Self {
-        TestNode::It {
-            name: name.into(),
-            focused: false,
-            pending: true,
-            labels: Vec::new(),
-            retries: None,
-            timeout_ms: None,
-            must_pass_repeatedly: None,
-            test_fn: Box::new(f),
-        }
+/// Extract a human-readable message from a panic payload.
+///
+/// Must be called with `&*e` (not `&e`) when `e: Box<dyn Any + Send>`,
+/// because `&Box<dyn Any>` coerces to a trait object for the Box itself
+/// rather than deref-ing through to the inner type.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
     }
 }
 
@@ -217,7 +256,7 @@ fn dim(s: &str) -> String {
 
 /// Results from running a test tree.
 #[derive(Default)]
-pub struct RunResult {
+pub(crate) struct RunResult {
     pub passed: usize,
     pub failed: usize,
     pub pending: usize,
@@ -226,7 +265,7 @@ pub struct RunResult {
 }
 
 /// Configuration parsed from command-line args.
-pub struct RunConfig {
+pub(crate) struct RunConfig {
     /// Filter string — only run tests whose full path contains this.
     pub filter: Option<String>,
     /// Only list tests, don't run them.
@@ -237,7 +276,7 @@ pub struct RunConfig {
 
 impl RunConfig {
     /// Parse from the process args (compatible with `cargo test -- <args>`).
-    pub fn from_args() -> Self {
+    pub(crate) fn from_args() -> Self {
         let args: Vec<String> = std::env::args().collect();
         let mut filter = None;
         let mut list = false;
@@ -264,25 +303,24 @@ impl RunConfig {
     }
 }
 
-/// A named suite with its source location, for multi-suite runs.
-pub struct Suite {
+/// A named suite for multi-suite runs.
+pub(crate) struct Suite {
     pub name: String,
-    pub file: String,
     pub nodes: Vec<TestNode>,
 }
 
 impl Suite {
-    pub fn new(name: impl Into<String>, file: impl Into<String>, nodes: Vec<TestNode>) -> Self {
+    pub fn new(name: impl Into<String>, nodes: Vec<TestNode>) -> Self {
         Suite {
             name: name.into(),
-            file: file.into(),
             nodes,
         }
     }
 }
 
 /// Run a single test tree and print BDD-formatted output.
-pub fn run_tree(nodes: &[TestNode], config: &RunConfig) -> RunResult {
+#[cfg(test)]
+fn run_tree(nodes: &[TestNode], config: &RunConfig) -> RunResult {
     let focus_mode = tree_has_focus(nodes);
     let mut result = RunResult::default();
     let start = Instant::now();
@@ -301,7 +339,7 @@ pub fn run_tree(nodes: &[TestNode], config: &RunConfig) -> RunResult {
 }
 
 /// Run multiple named suites, printing a header per suite and a combined summary.
-pub fn run_suites(suites: &[Suite], config: &RunConfig) -> RunResult {
+pub(crate) fn run_suites(suites: &[Suite], config: &RunConfig) -> RunResult {
     let focus_mode = suites.iter().any(|s| tree_has_focus(&s.nodes));
     let mut result = RunResult::default();
     let start = Instant::now();
@@ -316,14 +354,8 @@ pub fn run_suites(suites: &[Suite], config: &RunConfig) -> RunResult {
     println!();
 
     for suite in suites {
-        let header = match (suite.name.as_str(), suite.file.as_str()) {
-            ("", "") => String::new(),
-            (name, "") => name.to_string(),
-            ("", file) => file.to_string(),
-            (name, file) => format!("{name} ({file})"),
-        };
-        if !header.is_empty() {
-            println!("{}", dim(&format!("--- {} ---", header)));
+        if !suite.name.is_empty() {
+            println!("{}", dim(&format!("--- {} ---", suite.name)));
             println!();
         }
 
@@ -401,25 +433,44 @@ fn run_node(
             let child_hooks = hooks.with_describe(node);
             let child_force_focused = force_focused || *focused;
 
-            // Run before_all once at scope entry
-            for hook in before_all {
-                hook();
+            // Run before_all once at scope entry.
+            // If it panics, skip children but still run after_all.
+            let before_all_ok = catch_unwind(AssertUnwindSafe(|| {
+                for hook in before_all {
+                    hook();
+                }
+            }));
+
+            if let Err(e) = &before_all_ok {
+                let msg = panic_message(&**e);
+                let full_path = child_path.join(" > ");
+                println!("{indent}  {} before_all failed: {}", red("✗"), red(&msg));
+                result.failed += 1;
+                result.failures.push(format!("{full_path} (before_all): {msg}"));
+            } else {
+                run_nodes(
+                    children,
+                    depth + 1,
+                    &child_path,
+                    &child_hooks,
+                    focus_mode,
+                    child_force_focused,
+                    config,
+                    result,
+                );
             }
 
-            run_nodes(
-                children,
-                depth + 1,
-                &child_path,
-                &child_hooks,
-                focus_mode,
-                child_force_focused,
-                config,
-                result,
-            );
-
-            // Run after_all once at scope exit
-            for hook in after_all {
-                hook();
+            // Run after_all once at scope exit — even if before_all failed
+            if let Err(e) = catch_unwind(AssertUnwindSafe(|| {
+                for hook in after_all {
+                    hook();
+                }
+            })) {
+                let msg = panic_message(&*e);
+                let full_path = child_path.join(" > ");
+                println!("{indent}  {} after_all failed: {}", red("✗"), red(&msg));
+                result.failed += 1;
+                result.failures.push(format!("{full_path} (after_all): {msg}"));
             }
         }
         TestNode::It {
@@ -480,29 +531,37 @@ fn run_node(
             let start = Instant::now();
 
             let test_body = || {
-                // before_each (outermost first)
-                for hook in &hooks.before_each {
-                    hook();
-                }
-                // just_before_each (outermost first)
-                for hook in &hooks.just_before_each {
-                    hook();
-                }
-
-                // Run test with catch_unwind to guarantee after_each
+                // Run before_each + just_before_each + test body, catching any panic
+                // so that after_each and cleanups are guaranteed to run.
                 let body_result = catch_unwind(AssertUnwindSafe(|| {
+                    for hook in &hooks.before_each {
+                        hook();
+                    }
+                    for hook in &hooks.just_before_each {
+                        hook();
+                    }
                     test_fn();
                 }));
 
-                // after_each (innermost first)
+                // after_each (innermost first) — each individually protected
+                let mut after_each_panic = None;
                 for hook in hooks.after_each.iter().rev() {
-                    hook();
+                    if let Err(e) = catch_unwind(AssertUnwindSafe(hook)) {
+                        eprintln!("  warning: after_each hook panicked");
+                        if after_each_panic.is_none() {
+                            after_each_panic = Some(e);
+                        }
+                    }
                 }
 
                 // Deferred cleanups
                 crate::run_deferred_cleanups();
 
+                // Propagate the first failure: body takes priority over after_each
                 if let Err(e) = body_result {
+                    std::panic::resume_unwind(e);
+                }
+                if let Some(e) = after_each_panic {
                     std::panic::resume_unwind(e);
                 }
             };
@@ -531,7 +590,19 @@ fn run_node(
                 catch_unwind(AssertUnwindSafe(with_must_pass_repeatedly))
             };
 
-            report_outcome(&indent, name, &full_path, outcome, start, result);
+            // Check if the test called skip!() — report as skipped, not passed
+            if outcome.is_ok() {
+                if let Some(reason) = crate::take_skip_reason() {
+                    println!("{indent}{} {} {}", yellow("-"), dim(name), dim(&format!("({reason})")));
+                    result.skipped += 1;
+                } else {
+                    report_outcome(&indent, name, &full_path, outcome, start, result);
+                }
+            } else {
+                // Clear any skip flag set before the panic
+                let _ = crate::take_skip_reason();
+                report_outcome(&indent, name, &full_path, outcome, start, result);
+            }
         }
         TestNode::Ordered {
             name,
@@ -578,40 +649,57 @@ fn run_node(
             let start = Instant::now();
 
             let outcome = catch_unwind(AssertUnwindSafe(|| {
-                // Run before_each
-                for hook in &hooks.before_each {
-                    hook();
-                }
-                for hook in &hooks.just_before_each {
-                    hook();
-                }
-
-                let mut failures: Vec<Box<dyn std::any::Any + Send>> = Vec::new();
-
-                for step in steps {
-                    crate::by(&step.name);
-                    if *continue_on_failure {
-                        if let Err(e) = catch_unwind(AssertUnwindSafe(|| (step.body)())) {
-                            failures.push(e);
-                        }
-                    } else {
-                        (step.body)();
+                // Run before_each + just_before_each + steps, catching any panic
+                // so that after_each and cleanups are guaranteed to run.
+                let body_result = catch_unwind(AssertUnwindSafe(|| {
+                    for hook in &hooks.before_each {
+                        hook();
                     }
-                }
+                    for hook in &hooks.just_before_each {
+                        hook();
+                    }
 
-                // Run after_each
+                    let mut failures: Vec<Box<dyn std::any::Any + Send>> = Vec::new();
+
+                    for step in steps {
+                        crate::by(&step.name);
+                        if *continue_on_failure {
+                            if let Err(e) = catch_unwind(AssertUnwindSafe(|| (step.body)())) {
+                                failures.push(e);
+                            }
+                        } else {
+                            (step.body)();
+                        }
+                    }
+
+                    if !failures.is_empty() {
+                        panic!(
+                            "{} of {} ordered steps failed",
+                            failures.len(),
+                            steps.len()
+                        );
+                    }
+                }));
+
+                // after_each (innermost first) — each individually protected
+                let mut after_each_panic = None;
                 for hook in hooks.after_each.iter().rev() {
-                    hook();
+                    if let Err(e) = catch_unwind(AssertUnwindSafe(hook)) {
+                        eprintln!("  warning: after_each hook panicked");
+                        if after_each_panic.is_none() {
+                            after_each_panic = Some(e);
+                        }
+                    }
                 }
 
                 crate::run_deferred_cleanups();
 
-                if !failures.is_empty() {
-                    panic!(
-                        "{} of {} ordered steps failed",
-                        failures.len(),
-                        steps.len()
-                    );
+                // Propagate the first failure: body takes priority over after_each
+                if let Err(e) = body_result {
+                    std::panic::resume_unwind(e);
+                }
+                if let Some(e) = after_each_panic {
+                    std::panic::resume_unwind(e);
                 }
             }));
 
@@ -663,13 +751,7 @@ fn report_outcome(
             result.passed += 1;
         }
         Err(e) => {
-            let msg = if let Some(s) = e.downcast_ref::<&str>() {
-                s.to_string()
-            } else if let Some(s) = e.downcast_ref::<String>() {
-                s.clone()
-            } else {
-                "unknown panic".to_string()
-            };
+            let msg = panic_message(&*e);
             println!("{indent}{} {}{}", red("✗"), red(name), time_str);
             println!("{indent}  {}", red(&format!("Error: {msg}")));
             result.failed += 1;
@@ -694,14 +776,20 @@ fn run_with_timeout(
     let deadline = Duration::from_millis(ms);
 
     // Run the closure on the current thread
-    let _cleanup_guard = crate::Guard::new(crate::run_deferred_cleanups);
+    // (Cleanups are already handled inside test_body before any panic re-raises.)
     let result = catch_unwind(AssertUnwindSafe(|| {
         f();
     }));
 
     // Check if the closure exceeded the deadline
     if start.elapsed() > deadline {
-        Err(Box::new(format!("test timed out after {ms}ms")))
+        // If the test also panicked, include the original error
+        if let Err(e) = result {
+            let msg = panic_message(&*e);
+            Err(Box::new(format!("test timed out after {ms}ms (original error: {msg})")))
+        } else {
+            Err(Box::new(format!("test timed out after {ms}ms")))
+        }
     } else {
         result
     }
@@ -808,7 +896,7 @@ mod tests {
         let nodes = vec![TestNode::describe(
             "root",
             vec![
-                TestNode::fit("focused", || assert!(true)),
+                TestNode::fit("focused", || {}),
                 TestNode::Ordered {
                     name: "ordered".to_string(),
                     labels: Vec::new(),
@@ -834,6 +922,207 @@ mod tests {
         assert_eq!(result.passed, 1);
         assert_eq!(result.skipped, 1);
         assert!(!ORDERED_RAN.load(Ordering::SeqCst));
+    }
+
+    // C3 regression: skip!() should report as skipped, not passed
+    #[test]
+    fn skip_reports_as_skipped_not_passed() {
+        let nodes = vec![TestNode::it("skippable", || {
+            crate::skip("not ready");
+            // skip!() macro does `skip() + return`, but we can't use the macro
+            // in a Fn closure, so just call skip() — the runner checks the flag
+            // regardless of whether the closure returned early.
+        })];
+
+        let config = RunConfig {
+            filter: None,
+            list: false,
+            include_ignored: false,
+        };
+        let result = run_tree(&nodes, &config);
+
+        assert_eq!(result.skipped, 1, "should be reported as skipped");
+        assert_eq!(result.passed, 0, "should not be reported as passed");
+        assert_eq!(result.failed, 0);
+    }
+
+    // I1 regression: before_all panic should fail gracefully, not abort
+    #[test]
+    fn before_all_panic_reports_failure_and_runs_after_all() {
+        static AFTER_ALL_RAN: AtomicBool = AtomicBool::new(false);
+        AFTER_ALL_RAN.store(false, Ordering::SeqCst);
+
+        let nodes = vec![TestNode::describe_with_hooks(
+            "broken setup",
+            vec![Box::new(|| panic!("setup exploded"))],
+            vec![Box::new(|| {
+                AFTER_ALL_RAN.store(true, Ordering::SeqCst);
+            })],
+            vec![TestNode::it("should not run", || {
+                panic!("child should be skipped");
+            })],
+        )];
+
+        let config = RunConfig {
+            filter: None,
+            list: false,
+            include_ignored: false,
+        };
+        let result = run_tree(&nodes, &config);
+
+        assert_eq!(result.failed, 1, "before_all failure counted");
+        assert_eq!(result.passed, 0, "child should not have run");
+        assert!(AFTER_ALL_RAN.load(Ordering::SeqCst), "after_all must still run");
+    }
+
+    // I1 regression: after_all panic should report failure
+    #[test]
+    fn after_all_panic_reports_failure() {
+        let nodes = vec![TestNode::describe_with_hooks(
+            "broken teardown",
+            vec![],
+            vec![Box::new(|| panic!("teardown exploded"))],
+            vec![TestNode::it("passes", || {})],
+        )];
+
+        let config = RunConfig {
+            filter: None,
+            list: false,
+            include_ignored: false,
+        };
+        let result = run_tree(&nodes, &config);
+
+        assert_eq!(result.passed, 1, "test itself passed");
+        assert_eq!(result.failed, 1, "after_all failure counted");
+    }
+
+    // I3 regression: one cleanup panic should not prevent other cleanups
+    #[test]
+    fn deferred_cleanup_panic_does_not_skip_remaining() {
+        static SECOND_CLEANUP_RAN: AtomicBool = AtomicBool::new(false);
+        SECOND_CLEANUP_RAN.store(false, Ordering::SeqCst);
+
+        let nodes = vec![TestNode::it("cleanup test", || {
+            // First registered = runs last (LIFO)
+            crate::defer_cleanup(|| {
+                SECOND_CLEANUP_RAN.store(true, Ordering::SeqCst);
+            });
+            // Second registered = runs first, and panics
+            crate::defer_cleanup(|| {
+                panic!("cleanup boom");
+            });
+        })];
+
+        let config = RunConfig {
+            filter: None,
+            list: false,
+            include_ignored: false,
+        };
+        let result = run_tree(&nodes, &config);
+
+        // The test body itself passed, but cleanup panicked → reported as failure
+        assert_eq!(result.failed, 1);
+        assert!(
+            SECOND_CLEANUP_RAN.load(Ordering::SeqCst),
+            "second cleanup must run despite first panicking"
+        );
+    }
+
+    // C1 regression: before_each panic must still run after_each
+    #[test]
+    fn before_each_panic_still_runs_after_each() {
+        static AFTER_EACH_RAN: AtomicBool = AtomicBool::new(false);
+        AFTER_EACH_RAN.store(false, Ordering::SeqCst);
+
+        let nodes = vec![TestNode::describe_with_each_hooks(
+            "broken before_each",
+            vec![Box::new(|| panic!("before_each exploded"))],
+            vec![Box::new(|| {
+                AFTER_EACH_RAN.store(true, Ordering::SeqCst);
+            })],
+            vec![TestNode::it("test", || {})],
+        )];
+
+        let config = RunConfig {
+            filter: None,
+            list: false,
+            include_ignored: false,
+        };
+        let result = run_tree(&nodes, &config);
+
+        assert_eq!(result.failed, 1, "before_each failure reported");
+        assert!(AFTER_EACH_RAN.load(Ordering::SeqCst), "after_each must still run");
+    }
+
+    // C2 regression: after_each panic must not lose the original test failure
+    #[test]
+    fn after_each_panic_preserves_test_failure() {
+        let nodes = vec![TestNode::describe_with_each_hooks(
+            "both fail",
+            vec![],
+            vec![Box::new(|| panic!("after_each exploded"))],
+            vec![TestNode::it("fails", || {
+                panic!("test body failed");
+            })],
+        )];
+
+        let config = RunConfig {
+            filter: None,
+            list: false,
+            include_ignored: false,
+        };
+        let result = run_tree(&nodes, &config);
+
+        assert_eq!(result.failed, 1);
+        // The failure message should contain the body's error, not after_each's
+        assert!(
+            result.failures[0].contains("test body failed"),
+            "original test failure must be reported, got: {}",
+            result.failures[0]
+        );
+    }
+
+    // C2 regression: one after_each panic must not skip remaining after_each hooks
+    #[test]
+    fn after_each_panic_runs_remaining_hooks() {
+        static SECOND_AFTER_EACH_RAN: AtomicBool = AtomicBool::new(false);
+        SECOND_AFTER_EACH_RAN.store(false, Ordering::SeqCst);
+
+        // Outer describe has one after_each, inner describe has another that panics.
+        // The outer after_each must still run (after_each runs innermost first).
+        let inner = TestNode::describe_with_each_hooks(
+            "inner",
+            vec![],
+            vec![Box::new(|| panic!("inner after_each panicked"))],
+            vec![TestNode::it("test", || {})],
+        );
+        let outer = TestNode::describe_with_each_hooks(
+            "outer",
+            vec![],
+            vec![Box::new(|| {
+                SECOND_AFTER_EACH_RAN.store(true, Ordering::SeqCst);
+            })],
+            vec![inner],
+        );
+
+        let config = RunConfig {
+            filter: None,
+            list: false,
+            include_ignored: false,
+        };
+        let result = run_tree(&[outer], &config);
+
+        assert_eq!(result.failed, 1);
+        assert!(
+            SECOND_AFTER_EACH_RAN.load(Ordering::SeqCst),
+            "outer after_each must still run despite inner after_each panicking"
+        );
+    }
+
+    // I7 regression: mixed +, filter is rejected
+    #[test]
+    fn mixed_and_or_filter_is_rejected() {
+        assert!(!crate::labels_match_filter(&["a", "b"], "a+b,c"));
     }
 
     #[test]

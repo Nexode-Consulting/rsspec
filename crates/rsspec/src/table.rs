@@ -14,7 +14,7 @@ use std::rc::Rc;
 /// # fn main() { rsspec::run(|ctx| {
 /// ctx.describe_table("arithmetic")
 ///     .case("addition", (2i32, 3i32, 5i32))
-///     .case("subtraction", (5, 3, 2))
+///     .case("large numbers", (100, 200, 300))
 ///     .run(|(a, b, expected): &(i32, i32, i32)| {
 ///         assert_eq!(a + b, *expected);
 ///     });

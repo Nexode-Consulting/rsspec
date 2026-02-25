@@ -7,22 +7,26 @@ fn main() {
         // =================================================================
         ctx.describe("Calculator", |ctx| {
             ctx.it("adds two numbers", || {
-                assert_eq!(2 + 3, 5);
+                let (a, b) = (2, 3);
+                assert_eq!(a + b, 5);
             });
 
             ctx.it("multiplies", || {
-                assert_eq!(3 * 4, 12);
+                let (a, b) = (3, 4);
+                assert_eq!(a * b, 12);
             });
 
             ctx.context("with negative numbers", |ctx| {
                 ctx.it("handles negatives", || {
-                    assert_eq!(-1 + 3, 2);
+                    let (a, b) = (-1, 3);
+                    assert_eq!(a + b, 2);
                 });
             });
 
             ctx.when("dividing", |ctx| {
                 ctx.it("divides evenly", || {
-                    assert_eq!(10 / 2, 5);
+                    let (a, b) = (10, 2);
+                    assert_eq!(a / b, 5);
                 });
             });
         });

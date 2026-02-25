@@ -148,13 +148,11 @@ pub(crate) fn with_builder<R>(f: impl FnOnce(&mut SuiteBuilder) -> R) -> R {
 ///
 /// # Example
 /// ```rust,no_run
-/// fn main() {
-///     rsspec::run(|ctx| {
-///         ctx.describe("Calculator", |ctx| {
-///             ctx.it("adds", || { assert_eq!(2 + 3, 5); });
-///         });
+/// rsspec::run(|ctx| {
+///     ctx.describe("Calculator", |ctx| {
+///         ctx.it("adds", || { assert_eq!(2 + 3, 5); });
 ///     });
-/// }
+/// });
 /// ```
 #[derive(Copy, Clone)]
 pub struct Context;
@@ -388,6 +386,10 @@ impl ItBuilder {
     }
 
     /// Fail the test if it exceeds `ms` milliseconds.
+    ///
+    /// **Note:** The timeout is checked *after* the closure returns — the
+    /// closure cannot be forcibly aborted mid-execution. If your test blocks
+    /// forever (e.g. an infinite loop or deadlock), the timeout will not fire.
     pub fn timeout(mut self, ms: u64) -> Self {
         self.timeout_ms = Some(ms);
         self
@@ -402,6 +404,14 @@ impl ItBuilder {
 
 impl Drop for ItBuilder {
     fn drop(&mut self) {
+        // If we're already panicking (e.g. a describe body panicked), don't
+        // double-panic by trying to access the builder.
+        if std::thread::panicking() {
+            return;
+        }
+        let Some(body) = self.body.take() else {
+            return;
+        };
         let node = TestNode::It {
             name: std::mem::take(&mut self.name),
             focused: self.focused,
@@ -410,53 +420,97 @@ impl Drop for ItBuilder {
             retries: self.retries,
             timeout_ms: self.timeout_ms,
             must_pass_repeatedly: self.must_pass_repeatedly,
-            test_fn: self.body.take().unwrap(),
+            test_fn: body,
         };
         with_builder(|b| b.add_node(node));
     }
 }
 
 // ============================================================================
-// run() — entry point
+// run() / run_inline() — entry points
 // ============================================================================
 
-/// Build and run a BDD test suite.
-///
-/// This is the main entry point for rsspec. Call it from `fn main()` in a
-/// test target with `harness = false`.
-///
-/// # Example
-///
-/// ```rust,no_run
-/// fn main() {
-///     rsspec::run(|ctx| {
-///         ctx.describe("Calculator", |ctx| {
-///             ctx.it("adds", || { assert_eq!(2 + 3, 5); });
-///         });
-///     });
-/// }
-/// ```
-pub fn run(body: impl FnOnce(Context)) {
-    // Phase 1: build the tree
+/// Build the test tree from user closures.
+fn build_tree(body: impl FnOnce(Context)) -> Vec<TestNode> {
     BUILDER.with(|cell| {
         *cell.borrow_mut() = Some(SuiteBuilder::new());
     });
 
     body(Context);
 
-    let nodes = BUILDER.with(|cell| {
+    BUILDER.with(|cell| {
         cell.borrow_mut()
             .take()
             .expect("rsspec: builder missing after run")
             .into_nodes()
-    });
+    })
+}
 
-    // Phase 2: execute the tree
+/// Build and run a BDD test suite from a `harness = false` test target.
+///
+/// Parses command-line args for filtering/listing and calls
+/// [`std::process::exit`] on failure. **Do not use from `#[test]`
+/// functions** — use [`run_inline`] instead.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// rsspec::run(|ctx| {
+///     ctx.describe("Calculator", |ctx| {
+///         ctx.it("adds", || { assert_eq!(2 + 3, 5); });
+///     });
+/// });
+/// ```
+pub fn run(body: impl FnOnce(Context)) {
+    let nodes = build_tree(body);
     let config = RunConfig::from_args();
-    let suite = Suite::new("", "", nodes);
+    let suite = Suite::new("", nodes);
     let result = runner::run_suites(&[suite], &config);
 
     if result.failed > 0 {
         std::process::exit(1);
+    }
+}
+
+/// Build and run a BDD test suite inline, compatible with `#[test]` functions.
+///
+/// Unlike [`run`], this does **not** parse command-line args (avoiding
+/// conflicts with `cargo test`'s own filter arguments) and **panics** on
+/// failure instead of calling `process::exit`.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// #[test]
+/// fn calculator_spec() {
+///     rsspec::run_inline(|ctx| {
+///         ctx.describe("Calculator", |ctx| {
+///             ctx.it("adds", || { assert_eq!(2 + 3, 5); });
+///         });
+///     });
+/// }
+/// ```
+pub fn run_inline(body: impl FnOnce(Context)) {
+    let nodes = build_tree(body);
+    let config = RunConfig {
+        filter: None,
+        list: false,
+        include_ignored: false,
+    };
+    let suite = Suite::new("", nodes);
+    let result = runner::run_suites(&[suite], &config);
+
+    if result.failed > 0 {
+        let details = result
+            .failures
+            .iter()
+            .enumerate()
+            .map(|(i, f)| format!("  {}. {}", i + 1, f))
+            .collect::<Vec<_>>()
+            .join("\n");
+        panic!(
+            "rsspec: {} test(s) failed\n{}",
+            result.failed, details
+        );
     }
 }
