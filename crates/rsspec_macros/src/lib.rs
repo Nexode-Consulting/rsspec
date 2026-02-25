@@ -11,7 +11,7 @@ mod dsl;
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```text
 /// rsspec::suite! {
 ///     describe "Calculator" {
 ///         before_each {
@@ -67,7 +67,7 @@ mod dsl;
 /// - `it "name" timeout(1000) { ... }` — fail if test exceeds N milliseconds
 ///
 /// ## Table-driven tests
-/// ```rust,ignore
+/// ```text
 /// describe_table "arithmetic" (a: i32, b: i32, expected: i32) [
 ///     "addition" (2, 3, 5),
 ///     "subtraction" (5, 3, 2),
@@ -78,14 +78,14 @@ mod dsl;
 /// Focus/pending variants: `fdescribe_table`, `xdescribe_table`, `pdescribe_table`
 ///
 /// ## Ordered (sequential, fail-fast)
-/// ```rust,ignore
+/// ```text
 /// ordered "workflow" {
 ///     it "step 1" { create_resource(); }
 ///     it "step 2" { verify_resource(); }
 /// }
 /// ```
 /// Use `continue_on_failure` to run all steps even if earlier ones fail:
-/// ```rust,ignore
+/// ```text
 /// ordered "resilient" continue_on_failure {
 ///     it "step 1" { /* ... */ }
 ///     it "step 2" { /* runs even if step 1 fails */ }
@@ -117,7 +117,7 @@ pub fn suite(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
 /// ```
 ///
 /// In your test file:
-/// ```rust,ignore
+/// ```text
 /// rsspec::bdd! {
 ///     describe "Calculator" {
 ///         it "adds" { assert_eq!(2 + 3, 5); }
@@ -139,7 +139,7 @@ pub fn bdd(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
 ///
 /// Use this to build multiple suites and combine them in a custom `fn main()`:
 ///
-/// ```rust,ignore
+/// ```text
 /// fn main() {
 ///     let auth_nodes = rsspec::bdd_suite! {
 ///         describe "Auth" { it "works" { assert!(true); } }

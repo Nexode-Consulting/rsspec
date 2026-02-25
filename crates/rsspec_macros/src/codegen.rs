@@ -530,6 +530,14 @@ fn generate_it(block: &ItBlock, ctx: &GenContext) -> TokenStream {
         with_mpr
     };
 
+    // Ignored tests get an empty body so `cargo test -- --ignored` doesn't panic.
+    if is_ignored {
+        return quote! {
+            #test_attr
+            fn #fn_ident() {}
+        };
+    }
+
     quote! {
         #test_attr
         fn #fn_ident() {
@@ -673,21 +681,29 @@ fn generate_describe_table(block: &DescribeTableBlock, ctx: &GenContext) -> Toke
             }
         };
 
-        tests.extend(quote! {
-            #test_attr
-            fn #fn_ident() {
-                let _rsspec_defer_guard = rsspec::Guard::new(|| {
-                    rsspec::run_deferred_cleanups();
-                });
-                #focus_check
-                #(#before_all_code)*
-                #(#after_all_guards_code)*
-                #label_check
-                let _rsspec_entry: (#(#param_types),*,) = (#entry_values,);
-                #(#param_bindings)*
-                #inner_body
-            }
-        });
+        // Ignored tests get an empty body so `cargo test -- --ignored` doesn't panic.
+        if is_ignored {
+            tests.extend(quote! {
+                #test_attr
+                fn #fn_ident() {}
+            });
+        } else {
+            tests.extend(quote! {
+                #test_attr
+                fn #fn_ident() {
+                    let _rsspec_defer_guard = rsspec::Guard::new(|| {
+                        rsspec::run_deferred_cleanups();
+                    });
+                    #focus_check
+                    #(#before_all_code)*
+                    #(#after_all_guards_code)*
+                    #label_check
+                    let _rsspec_entry: (#(#param_types),*,) = (#entry_values,);
+                    #(#param_bindings)*
+                    #inner_body
+                }
+            });
+        }
     }
 
     quote! {
@@ -832,6 +848,14 @@ fn generate_ordered(block: &OrderedBlock, ctx: &GenContext) -> TokenStream {
             }
         }
     };
+
+    // Ignored tests get an empty body so `cargo test -- --ignored` doesn't panic.
+    if is_ignored {
+        return quote! {
+            #test_attr
+            fn #fn_ident() {}
+        };
+    }
 
     quote! {
         #test_attr
