@@ -107,16 +107,6 @@ name = "rsspec"
 version = "0.1.0"
 dependencies = [
  "googletest",
- "rsspec_macros",
-]
-
-[[package]]
-name = "rsspec_macros"
-version = "0.1.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
 ]
 
 [[package]]

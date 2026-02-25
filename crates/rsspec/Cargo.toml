@@ -9,17 +9,12 @@ categories.workspace = true
 description = "A Ginkgo/RSpec-inspired BDD testing framework for Rust."
 
 [features]
-default = ["macros"]
-macros = ["dep:rsspec_macros"]
+default = []
 googletest = ["dep:googletest"]
 
 [dependencies]
-rsspec_macros = { path = "../rsspec_macros", version = "0.1.0", optional = true }
 googletest = { version = "0.14", optional = true }
 
-[dev-dependencies]
-rsspec_macros = { path = "../rsspec_macros", version = "0.1.0" }
-
 [[test]]
-name = "bdd_runner_test"
+name = "closure_api_test"
 harness = false
