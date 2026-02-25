@@ -615,6 +615,13 @@ fn generate_describe_table(block: &DescribeTableBlock, ctx: &GenContext) -> Toke
             if !rsspec::check_labels(&[]) { return; }
         };
 
+        // Fail-on-focus check
+        let focus_check = if effectively_focused && ctx.focus_mode {
+            quote! { rsspec::check_fail_on_focus(); }
+        } else {
+            quote! {}
+        };
+
         // Inline subject
         let subject_code = ctx.subject.as_ref().map(|expr| {
             quote! { let subject = { #expr }; }
@@ -649,6 +656,7 @@ fn generate_describe_table(block: &DescribeTableBlock, ctx: &GenContext) -> Toke
                 let _rsspec_defer_guard = rsspec::Guard::new(|| {
                     rsspec::run_deferred_cleanups();
                 });
+                #focus_check
                 #(#before_all_code)*
                 #(#after_all_guards_code)*
                 #label_check
@@ -675,6 +683,23 @@ fn generate_ordered(block: &OrderedBlock, ctx: &GenContext) -> TokenStream {
     let fn_name = sanitize_name(&block.name.value());
     let fn_ident = Ident::new(&fn_name, Span::call_site());
 
+    // Focus-awareness: ordered blocks are ignored when focus mode is active
+    // and the block isn't in a focused scope
+    let is_ignored = ctx.focus_mode && !ctx.force_focused;
+
+    let test_attr = if is_ignored {
+        quote! { #[test] #[ignore] }
+    } else {
+        quote! { #[test] }
+    };
+
+    // Fail-on-focus check
+    let focus_check = if ctx.force_focused && ctx.focus_mode {
+        quote! { rsspec::check_fail_on_focus(); }
+    } else {
+        quote! {}
+    };
+
     // before_all
     let before_all_code: Vec<TokenStream> = ctx
         .before_all
@@ -684,21 +709,24 @@ fn generate_ordered(block: &OrderedBlock, ctx: &GenContext) -> TokenStream {
         })
         .collect();
 
-    // after_all
-    let after_all_guards_code: Vec<TokenStream> = ctx
-        .after_all_guards
-        .iter()
-        .enumerate()
-        .map(|(i, (counter_ident, total, all_body))| {
-            let guard_name = Ident::new(&format!("_after_all_guard_{i}"), Span::call_site());
-            let total_u32 = *total as u32;
-            quote! {
-                let #guard_name = rsspec::AfterAllGuard::new(
-                    &#counter_ident, #total_u32, || { #all_body },
-                );
-            }
-        })
-        .collect();
+    // after_all (only for non-ignored tests)
+    let after_all_guards_code: Vec<TokenStream> = if is_ignored {
+        Vec::new()
+    } else {
+        ctx.after_all_guards
+            .iter()
+            .enumerate()
+            .map(|(i, (counter_ident, total, all_body))| {
+                let guard_name = Ident::new(&format!("_after_all_guard_{i}"), Span::call_site());
+                let total_u32 = *total as u32;
+                quote! {
+                    let #guard_name = rsspec::AfterAllGuard::new(
+                        &#counter_ident, #total_u32, || { #all_body },
+                    );
+                }
+            })
+            .collect()
+    };
 
     let after_each_bodies: Vec<_> = ctx.after_each.iter().rev().collect();
 
@@ -776,11 +804,12 @@ fn generate_ordered(block: &OrderedBlock, ctx: &GenContext) -> TokenStream {
     };
 
     quote! {
-        #[test]
+        #test_attr
         fn #fn_ident() {
             let _rsspec_defer_guard = rsspec::Guard::new(|| {
                 rsspec::run_deferred_cleanups();
             });
+            #focus_check
             #(#before_all_code)*
             #(#after_all_guards_code)*
             #label_check
@@ -828,6 +857,8 @@ struct BddGenContext {
     just_before_each: Vec<TokenStream>,
     after_each: Vec<TokenStream>,
     subject: Option<TokenStream>,
+    /// Whether all children should be treated as focused (inside fdescribe/fcontext).
+    force_focused: bool,
 }
 
 impl BddGenContext {
@@ -837,6 +868,7 @@ impl BddGenContext {
             just_before_each: Vec::new(),
             after_each: Vec::new(),
             subject: None,
+            force_focused: false,
         }
     }
 
@@ -846,6 +878,7 @@ impl BddGenContext {
             just_before_each: self.just_before_each.clone(),
             after_each: self.after_each.clone(),
             subject: self.subject.clone(),
+            force_focused: self.force_focused,
         }
     }
 }
@@ -882,8 +915,12 @@ fn generate_bdd_items(items: &[DslItem], ctx: &BddGenContext) -> Vec<TokenStream
                         rsspec::runner::TestNode::describe(#name, vec![#(#child_nodes),*])
                     });
                 } else {
-                    // Pass accumulated hooks to children
-                    let child_nodes = generate_bdd_items(&block.items, &local_ctx);
+                    // Propagate focus from fdescribe/fcontext to children
+                    let mut child_ctx = local_ctx.child();
+                    if block.focused {
+                        child_ctx.force_focused = true;
+                    }
+                    let child_nodes = generate_bdd_items(&block.items, &child_ctx);
                     nodes.push(quote! {
                         rsspec::runner::TestNode::describe(#name, vec![#(#child_nodes),*])
                     });
@@ -904,8 +941,27 @@ fn generate_bdd_items(items: &[DslItem], ctx: &BddGenContext) -> Vec<TokenStream
                     quote! { let subject = { #expr }; }
                 });
 
-                // Use catch_unwind pattern for after_each (same as suite! path)
-                let it_body = if local_ctx.after_each.is_empty() {
+                let effectively_focused = block.focused || local_ctx.force_focused;
+
+                // Fail-on-focus check
+                let focus_check = if effectively_focused {
+                    quote! { rsspec::check_fail_on_focus(); }
+                } else {
+                    quote! {}
+                };
+
+                // Label check
+                let label_strs: Vec<_> = block.labels.iter().collect();
+                let label_check = if block.labels.is_empty() {
+                    quote! {}
+                } else {
+                    quote! {
+                        if !rsspec::check_labels(&[#(#label_strs),*]) { return; }
+                    }
+                };
+
+                // Build inner body: hooks + subject + body [+ after_each]
+                let inner_body = if local_ctx.after_each.is_empty() {
                     quote! {
                         #(#be)*
                         #(#jbe)*
@@ -927,12 +983,40 @@ fn generate_bdd_items(items: &[DslItem], ctx: &BddGenContext) -> Vec<TokenStream
                     }
                 };
 
+                // Wrap with retries
+                let with_retries = if let Some(n) = block.retries {
+                    quote! { rsspec::with_retries(#n, || { #inner_body }); }
+                } else {
+                    inner_body
+                };
+
+                // Wrap with must_pass_repeatedly
+                let with_mpr = if let Some(n) = block.must_pass_repeatedly {
+                    quote! { rsspec::must_pass_repeatedly(#n, || { #with_retries }); }
+                } else {
+                    with_retries
+                };
+
+                // Wrap with timeout
+                let test_body = if let Some(ms) = block.timeout_ms {
+                    quote! { rsspec::with_timeout(#ms, || { #with_mpr }); }
+                } else {
+                    with_mpr
+                };
+
+                // Full body with focus check and label check
+                let full_body = quote! {
+                    #focus_check
+                    #label_check
+                    #test_body
+                };
+
                 let constructor = if block.pending {
                     quote! { rsspec::runner::TestNode::xit(#name, || {}) }
-                } else if block.focused {
-                    quote! { rsspec::runner::TestNode::fit(#name, || { #it_body }) }
+                } else if effectively_focused {
+                    quote! { rsspec::runner::TestNode::fit(#name, || { #full_body }) }
                 } else {
-                    quote! { rsspec::runner::TestNode::it(#name, || { #it_body }) }
+                    quote! { rsspec::runner::TestNode::it(#name, || { #full_body }) }
                 };
 
                 nodes.push(constructor);

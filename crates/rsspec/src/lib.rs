@@ -1,36 +1,61 @@
 //! # rsspec — A Ginkgo/RSpec-inspired BDD testing framework for Rust
 //!
-//! Write your tests in a familiar BDD style:
+//! Write expressive, structured tests using a familiar BDD syntax with
+//! `describe`, `context`, `it`, lifecycle hooks, table-driven tests, and more.
+//!
+//! ## Three ways to run tests
+//!
+//! - **[`suite!`]** — generates `#[test]` functions, works with `cargo test`
+//! - **[`bdd!`]** — generates a `main()` with colored tree output (`harness = false`)
+//! - **[`bdd_suite!`]** — returns test nodes for combining multiple suites
+//!
+//! ## Quick example
 //!
 //! ```rust
 //! rsspec::suite! {
 //!     describe "Calculator" {
 //!         before_each {
-//!             let result: i32;
+//!             let a = 2;
+//!             let b = 3;
 //!         }
 //!
+//!         subject { a + b }
+//!
 //!         it "adds two numbers" {
-//!             let result = 2 + 3;
-//!             assert_eq!(result, 5);
+//!             assert_eq!(subject, 5);
 //!         }
 //!
 //!         context "with negative numbers" {
 //!             it "handles negatives" {
-//!                 let result = -1 + 3;
-//!                 assert_eq!(result, 2);
+//!                 assert_eq!(-1 + b, 2);
 //!             }
 //!         }
 //!     }
 //! }
 //! ```
 //!
+//! ## Features
+//!
+//! - `macros` *(default)* — enables `suite!`, `bdd!`, `bdd_suite!` macros
+//! - `googletest` — re-exports `googletest` matchers via `rsspec::matchers`
+//!
 //! See the [`suite!`] macro documentation for the full DSL reference.
 
 pub mod runner;
 
+/// Re-export of the [`googletest`] crate. Available with the `googletest` feature.
 #[cfg(feature = "googletest")]
 pub use googletest;
 
+/// Composable matchers re-exported from [`googletest::prelude`].
+///
+/// Enable with `features = ["googletest"]`, then:
+///
+/// ```rust,ignore
+/// use rsspec::matchers::*;
+///
+/// assert_that!(vec![1, 2, 3], contains(eq(2)));
+/// ```
 #[cfg(feature = "googletest")]
 pub mod matchers {
     pub use googletest::prelude::*;
@@ -150,6 +175,9 @@ pub fn with_timeout(timeout_ms: u64, f: impl FnOnce() + Send + 'static) {
 
     let (tx, rx) = mpsc::channel();
     let handle = std::thread::spawn(move || {
+        // Guard ensures deferred cleanups run on this thread even on panic,
+        // since the cleanup stack is thread-local and the outer thread can't drain it.
+        let _cleanup_guard = Guard::new(run_deferred_cleanups);
         f();
         let _ = tx.send(());
     });

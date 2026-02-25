@@ -5,22 +5,31 @@ mod dsl;
 
 /// A Ginkgo/RSpec-inspired BDD test suite macro.
 ///
+/// Generates individual `#[test]` functions from a BDD-style DSL.
+/// Each `it` block becomes a standalone test; `describe`/`context` blocks
+/// become nested modules.
+///
 /// # Example
 ///
 /// ```rust,ignore
 /// rsspec::suite! {
 ///     describe "Calculator" {
 ///         before_each {
-///             let mut calc = Calculator::new();
+///             let a = 2;
+///             let b = 3;
 ///         }
 ///
+///         subject { a + b }
+///
 ///         it "adds two numbers" {
-///             assert_eq!(calc.add(2, 3), 5);
+///             assert_eq!(subject, 5);
 ///         }
+///
+///         it { assert!(subject > 0); }
 ///
 ///         context "with negative numbers" {
 ///             it "handles negatives" {
-///                 assert_eq!(calc.add(-1, 3), 2);
+///                 assert_eq!(-1 + b, 2);
 ///             }
 ///         }
 ///     }
@@ -36,18 +45,26 @@ mod dsl;
 ///
 /// ## Specs
 /// - `it "name" { ... }` / `specify "name" { ... }`
+/// - `it { ... }` — nameless spec (auto-named `spec_1`, `spec_2`, etc.)
 /// - `fit` / `fspecify` — focused
 /// - `xit` / `xspecify` / `pit` / `pspecify` — pending
 ///
 /// ## Lifecycle hooks
 /// - `before_each { ... }` — runs before every `it` in this scope (and nested scopes)
+/// - `just_before_each { ... }` — runs after all `before_each`, right before the body
 /// - `after_each { ... }` — runs after every `it` (even on panic)
 /// - `before_all { ... }` — runs once before all tests in scope
 /// - `after_all { ... }` — runs once after all tests in scope
 ///
+/// ## Subject
+/// - `subject { expr }` — evaluated before each test body, bound as `let subject = { expr };`
+/// - Nested subjects override parent (last one wins, matching RSpec semantics)
+///
 /// ## Decorators (on `it` blocks)
 /// - `it "name" labels("integration", "slow") { ... }` — label filtering via `RSSPEC_LABEL_FILTER`
 /// - `it "name" retries(3) { ... }` — retry flaky tests
+/// - `it "name" must_pass_repeatedly(5) { ... }` — require N consecutive passes
+/// - `it "name" timeout(1000) { ... }` — fail if test exceeds N milliseconds
 ///
 /// ## Table-driven tests
 /// ```rust,ignore
@@ -58,6 +75,7 @@ mod dsl;
 ///     assert_eq!(a + b, expected);
 /// }
 /// ```
+/// Focus/pending variants: `fdescribe_table`, `xdescribe_table`, `pdescribe_table`
 ///
 /// ## Ordered (sequential, fail-fast)
 /// ```rust,ignore
@@ -65,6 +83,19 @@ mod dsl;
 ///     it "step 1" { create_resource(); }
 ///     it "step 2" { verify_resource(); }
 /// }
+/// ```
+/// Use `continue_on_failure` to run all steps even if earlier ones fail:
+/// ```rust,ignore
+/// ordered "resilient" continue_on_failure {
+///     it "step 1" { /* ... */ }
+///     it "step 2" { /* runs even if step 1 fails */ }
+/// }
+/// ```
+///
+/// # Execution order
+///
+/// ```text
+/// before_all (once per scope) -> before_each -> just_before_each -> subject -> body -> after_each -> after_all (once per scope)
 /// ```
 #[proc_macro]
 pub fn suite(input: proc_macro::TokenStream) -> proc_macro::TokenStream {

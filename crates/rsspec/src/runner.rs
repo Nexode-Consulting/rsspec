@@ -34,6 +34,7 @@ pub enum TestNode {
 }
 
 impl TestNode {
+    /// Create a describe/context container with child nodes.
     pub fn describe(name: impl Into<String>, children: Vec<TestNode>) -> Self {
         TestNode::Describe {
             name: name.into(),
@@ -41,6 +42,7 @@ impl TestNode {
         }
     }
 
+    /// Create a normal test case.
     pub fn it(name: impl Into<String>, f: impl Fn() + Send + Sync + 'static) -> Self {
         TestNode::It {
             name: name.into(),
@@ -50,6 +52,7 @@ impl TestNode {
         }
     }
 
+    /// Create a focused test case — when any node is focused, only focused nodes run.
     pub fn fit(name: impl Into<String>, f: impl Fn() + Send + Sync + 'static) -> Self {
         TestNode::It {
             name: name.into(),
@@ -59,6 +62,7 @@ impl TestNode {
         }
     }
 
+    /// Create a pending (skipped) test case.
     pub fn xit(name: impl Into<String>, f: impl Fn() + Send + Sync + 'static) -> Self {
         TestNode::It {
             name: name.into(),
@@ -183,6 +187,7 @@ pub struct Suite {
 }
 
 impl Suite {
+    /// Create a named suite. Use `file!()` for the file path to get source locations in output.
     pub fn new(name: impl Into<String>, file: impl Into<String>, nodes: Vec<TestNode>) -> Self {
         Suite {
             name: name.into(),
