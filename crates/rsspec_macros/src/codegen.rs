@@ -18,6 +18,7 @@ pub fn generate(suite: Suite) -> TokenStream {
         before_all: Vec::new(),
         after_all_guards: Vec::new(),
         subject: None,
+        inherited_labels: Vec::new(),
         focus_mode: has_focus,
         force_focused: false,
     };
@@ -46,6 +47,8 @@ struct GenContext {
     /// Subject expression — inlined as `let subject = { expr };` after just_before_each.
     /// Nested subjects override parent (last one wins).
     subject: Option<TokenStream>,
+    /// Labels inherited from parent containers — merged with per-test labels.
+    inherited_labels: Vec<String>,
     /// Whether any node in the entire suite is focused.
     focus_mode: bool,
     /// Whether all children should be treated as focused (inside fdescribe/fcontext).
@@ -61,6 +64,7 @@ impl GenContext {
             before_all: self.before_all.clone(),
             after_all_guards: self.after_all_guards.clone(),
             subject: self.subject.clone(),
+            inherited_labels: self.inherited_labels.clone(),
             focus_mode: self.focus_mode,
             force_focused: self.force_focused,
         }
@@ -196,6 +200,11 @@ fn generate_describe(block: &DescribeBlock, ctx: &GenContext) -> TokenStream {
     // Propagate focus from fdescribe/fcontext to children
     if block.focused {
         child_ctx.force_focused = true;
+    }
+
+    // Propagate labels from container to children
+    for label in &block.labels {
+        child_ctx.inherited_labels.push(label.value());
     }
 
     // Scan for before_all hooks at this describe level and set up module-level statics
@@ -356,6 +365,7 @@ fn generate_items_pending(items: &[DslItem], ctx: &mut GenContext) -> TokenStrea
                     name: block.name.clone(),
                     focused: false,
                     pending: true,
+                    labels: block.labels.clone(),
                     params: block.params.iter().map(|p| TableParam { name: p.name.clone(), ty: p.ty.clone() }).collect(),
                     entries: block.entries.iter().map(|e| TableEntry { label: e.label.clone(), values: e.values.clone() }).collect(),
                     body: block.body.clone(),
@@ -435,10 +445,16 @@ fn generate_it(block: &ItBlock, ctx: &GenContext) -> TokenStream {
             .collect()
     };
 
-    // Label filtering — always emit, even for unlabeled tests
-    let label_strs: Vec<_> = block.labels.iter().collect();
+    // Label filtering — merge inherited labels from containers with per-test labels
+    let inherited_label_strs: Vec<_> = ctx.inherited_labels.iter().map(|s| s.as_str()).collect();
+    let it_label_strs: Vec<_> = block.labels.iter().map(|l| l.value()).collect();
+    let all_labels: Vec<&str> = inherited_label_strs
+        .iter()
+        .copied()
+        .chain(it_label_strs.iter().map(|s| s.as_str()))
+        .collect();
     let label_check = quote! {
-        if !rsspec::check_labels(&[#(#label_strs),*]) {
+        if !rsspec::check_labels(&[#(#all_labels),*]) {
             return;
         }
     };
@@ -610,9 +626,16 @@ fn generate_describe_table(block: &DescribeTableBlock, ctx: &GenContext) -> Toke
                 .collect()
         };
 
-        // Label check
+        // Label check — merge inherited + block-level labels
+        let inherited_label_strs: Vec<_> = ctx.inherited_labels.iter().map(|s| s.as_str()).collect();
+        let block_label_strs: Vec<_> = block.labels.iter().map(|l| l.value()).collect();
+        let all_labels: Vec<&str> = inherited_label_strs
+            .iter()
+            .copied()
+            .chain(block_label_strs.iter().map(|s| s.as_str()))
+            .collect();
         let label_check = quote! {
-            if !rsspec::check_labels(&[]) { return; }
+            if !rsspec::check_labels(&[#(#all_labels),*]) { return; }
         };
 
         // Fail-on-focus check
@@ -753,9 +776,16 @@ fn generate_ordered(block: &OrderedBlock, ctx: &GenContext) -> TokenStream {
         }
     }
 
-    // Label check
+    // Label check — merge inherited + block-level labels
+    let inherited_label_strs: Vec<_> = ctx.inherited_labels.iter().map(|s| s.as_str()).collect();
+    let block_label_strs: Vec<_> = block.labels.iter().map(|l| l.value()).collect();
+    let all_labels: Vec<&str> = inherited_label_strs
+        .iter()
+        .copied()
+        .chain(block_label_strs.iter().map(|s| s.as_str()))
+        .collect();
     let label_check = quote! {
-        if !rsspec::check_labels(&[]) { return; }
+        if !rsspec::check_labels(&[#(#all_labels),*]) { return; }
     };
 
     let ordered_body = if block.continue_on_failure {
@@ -857,6 +887,8 @@ struct BddGenContext {
     just_before_each: Vec<TokenStream>,
     after_each: Vec<TokenStream>,
     subject: Option<TokenStream>,
+    /// Labels inherited from parent containers — merged with per-test labels.
+    inherited_labels: Vec<String>,
     /// Whether all children should be treated as focused (inside fdescribe/fcontext).
     force_focused: bool,
 }
@@ -868,6 +900,7 @@ impl BddGenContext {
             just_before_each: Vec::new(),
             after_each: Vec::new(),
             subject: None,
+            inherited_labels: Vec::new(),
             force_focused: false,
         }
     }
@@ -878,6 +911,7 @@ impl BddGenContext {
             just_before_each: self.just_before_each.clone(),
             after_each: self.after_each.clone(),
             subject: self.subject.clone(),
+            inherited_labels: self.inherited_labels.clone(),
             force_focused: self.force_focused,
         }
     }
@@ -915,10 +949,13 @@ fn generate_bdd_items(items: &[DslItem], ctx: &BddGenContext) -> Vec<TokenStream
                         rsspec::runner::TestNode::describe(#name, vec![#(#child_nodes),*])
                     });
                 } else {
-                    // Propagate focus from fdescribe/fcontext to children
+                    // Propagate focus and labels from container to children
                     let mut child_ctx = local_ctx.child();
                     if block.focused {
                         child_ctx.force_focused = true;
+                    }
+                    for label in &block.labels {
+                        child_ctx.inherited_labels.push(label.value());
                     }
                     let child_nodes = generate_bdd_items(&block.items, &child_ctx);
                     nodes.push(quote! {
@@ -950,13 +987,19 @@ fn generate_bdd_items(items: &[DslItem], ctx: &BddGenContext) -> Vec<TokenStream
                     quote! {}
                 };
 
-                // Label check
-                let label_strs: Vec<_> = block.labels.iter().collect();
-                let label_check = if block.labels.is_empty() {
+                // Label check — merge inherited labels from containers with per-test labels
+                let inherited_label_strs: Vec<_> = local_ctx.inherited_labels.iter().map(|s| s.as_str()).collect();
+                let it_label_strs: Vec<_> = block.labels.iter().map(|l| l.value()).collect();
+                let all_labels: Vec<&str> = inherited_label_strs
+                    .iter()
+                    .copied()
+                    .chain(it_label_strs.iter().map(|s| s.as_str()))
+                    .collect();
+                let label_check = if all_labels.is_empty() {
                     quote! {}
                 } else {
                     quote! {
-                        if !rsspec::check_labels(&[#(#label_strs),*]) { return; }
+                        if !rsspec::check_labels(&[#(#all_labels),*]) { return; }
                     }
                 };
 
@@ -1025,6 +1068,22 @@ fn generate_bdd_items(items: &[DslItem], ctx: &BddGenContext) -> Vec<TokenStream
                 let table_name = block.name.value();
                 let mut entry_nodes = Vec::new();
 
+                // Merge inherited + block labels for table entries
+                let inherited_label_strs: Vec<_> = local_ctx.inherited_labels.iter().map(|s| s.as_str()).collect();
+                let block_label_strs: Vec<_> = block.labels.iter().map(|l| l.value()).collect();
+                let all_labels: Vec<&str> = inherited_label_strs
+                    .iter()
+                    .copied()
+                    .chain(block_label_strs.iter().map(|s| s.as_str()))
+                    .collect();
+                let label_check = if all_labels.is_empty() {
+                    quote! {}
+                } else {
+                    quote! {
+                        if !rsspec::check_labels(&[#(#all_labels),*]) { return; }
+                    }
+                };
+
                 for (i, entry) in block.entries.iter().enumerate() {
                     let entry_name = if let Some(ref label) = entry.label {
                         label.value()
@@ -1058,6 +1117,7 @@ fn generate_bdd_items(items: &[DslItem], ctx: &BddGenContext) -> Vec<TokenStream
 
                     let entry_body = if local_ctx.after_each.is_empty() {
                         quote! {
+                            #label_check
                             let _rsspec_entry: (#(#param_types),*,) = (#entry_values,);
                             #(#param_bindings)*
                             #(#be)*
@@ -1067,6 +1127,7 @@ fn generate_bdd_items(items: &[DslItem], ctx: &BddGenContext) -> Vec<TokenStream
                         }
                     } else {
                         quote! {
+                            #label_check
                             let _rsspec_entry: (#(#param_types),*,) = (#entry_values,);
                             #(#param_bindings)*
                             #(#be)*
@@ -1102,6 +1163,23 @@ fn generate_bdd_items(items: &[DslItem], ctx: &BddGenContext) -> Vec<TokenStream
                 let subject_code = local_ctx.subject.as_ref().map(|expr| {
                     quote! { let subject = { #expr }; }
                 });
+
+                // Merge inherited + block labels for ordered test
+                let inherited_label_strs: Vec<_> = local_ctx.inherited_labels.iter().map(|s| s.as_str()).collect();
+                let block_label_strs: Vec<_> = block.labels.iter().map(|l| l.value()).collect();
+                let all_labels: Vec<&str> = inherited_label_strs
+                    .iter()
+                    .copied()
+                    .chain(block_label_strs.iter().map(|s| s.as_str()))
+                    .collect();
+                let label_check = if all_labels.is_empty() {
+                    quote! {}
+                } else {
+                    quote! {
+                        if !rsspec::check_labels(&[#(#all_labels),*]) { return; }
+                    }
+                };
+
                 let mut step_bodies = Vec::new();
                 for item in &block.items {
                     if let DslItem::It(it_block) = item {
@@ -1118,6 +1196,7 @@ fn generate_bdd_items(items: &[DslItem], ctx: &BddGenContext) -> Vec<TokenStream
                 }
                 nodes.push(quote! {
                     rsspec::runner::TestNode::it(#name, || {
+                        #label_check
                         #(#step_bodies)*
                     })
                 });

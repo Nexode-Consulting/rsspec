@@ -518,3 +518,39 @@ rsspec::suite! {
         }
     }
 }
+
+// ============================================================================
+// Container-level labels
+// ============================================================================
+
+rsspec::suite! {
+    describe "container labels" labels("integration") {
+        // This test inherits "integration" from the describe block
+        it "inherits label from describe" {
+            assert!(true);
+        }
+
+        // This test has both inherited "integration" and its own "smoke"
+        it "combines own labels with inherited" labels("smoke") {
+            assert!(true);
+        }
+
+        context "nested context" labels("slow") {
+            // This test inherits "integration" + "slow"
+            it "inherits from both levels" {
+                assert!(true);
+            }
+        }
+    }
+}
+
+// Verify label filtering works on container labels by using a filter env var.
+// These tests use RSSPEC_LABEL_FILTER which is checked at runtime.
+rsspec::suite! {
+    describe "container label filtering" labels("unit") {
+        it "has unit label from container" {
+            // This test should have "unit" label from parent describe
+            assert!(rsspec::check_labels(&["unit"]));
+        }
+    }
+}

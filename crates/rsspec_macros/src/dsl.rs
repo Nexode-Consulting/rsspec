@@ -33,11 +33,13 @@ pub enum DslItem {
 
 /// `describe "name" { ... }` / `context "name" { ... }` / `when "name" { ... }`
 /// Also handles focused (`fdescribe`, `fcontext`) and pending (`xdescribe`, `xcontext`, `pdescribe`, `pcontext`).
+/// Supports `labels(...)` decorator — labels propagate to all child tests.
 #[derive(Debug)]
 pub struct DescribeBlock {
     pub name: LitStr,
     pub focused: bool,
     pub pending: bool,
+    pub labels: Vec<LitStr>,
     pub items: Vec<DslItem>,
 }
 
@@ -62,11 +64,13 @@ pub struct HookBlock {
 }
 
 /// `describe_table "name" (a: Type, b: Type) [ (v1, v2), ... ] { body }`
+/// Supports `labels(...)` decorator — labels propagate to all generated tests.
 #[derive(Debug)]
 pub struct DescribeTableBlock {
     pub name: LitStr,
     pub focused: bool,
     pub pending: bool,
+    pub labels: Vec<LitStr>,
     pub params: Vec<TableParam>,
     pub entries: Vec<TableEntry>,
     pub body: TokenStream,
@@ -87,9 +91,11 @@ pub struct TableEntry {
 }
 
 /// `ordered "name" { ... }` or `ordered "name" continue_on_failure { ... }`
+/// Supports `labels(...)` decorator — labels propagate to the generated test.
 #[derive(Debug)]
 pub struct OrderedBlock {
     pub name: LitStr,
+    pub labels: Vec<LitStr>,
     pub continue_on_failure: bool,
     pub items: Vec<DslItem>,
 }
@@ -177,13 +183,37 @@ impl Parse for DslItem {
 // Block parsers
 // ============================================================================
 
-/// Parse: `"name" { items... }`
+/// Parse an optional `labels("a", "b")` decorator before a brace.
+fn parse_optional_labels(input: ParseStream) -> Result<Vec<LitStr>> {
+    let mut labels = Vec::new();
+    if input.peek(Ident) && !input.peek2(syn::token::Brace) {
+        let fork = input.fork();
+        if let Ok(ident) = fork.parse::<Ident>() {
+            if ident == "labels" {
+                // Consume from the real stream
+                let _: Ident = input.parse()?;
+                let content;
+                parenthesized!(content in input);
+                while !content.is_empty() {
+                    labels.push(content.parse::<LitStr>()?);
+                    if !content.is_empty() {
+                        content.parse::<Token![,]>()?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(labels)
+}
+
+/// Parse: `"name" [labels(...)] { items... }`
 fn parse_describe_block(
     input: ParseStream,
     focused: bool,
     pending: bool,
 ) -> Result<DescribeBlock> {
     let name: LitStr = input.parse()?;
+    let labels = parse_optional_labels(input)?;
     let content;
     braced!(content in input);
     let items = parse_items(&content)?;
@@ -191,6 +221,7 @@ fn parse_describe_block(
         name,
         focused,
         pending,
+        labels,
         items,
     })
 }
@@ -278,13 +309,14 @@ fn parse_hook_block(input: ParseStream) -> Result<HookBlock> {
     Ok(HookBlock { body })
 }
 
-/// Parse: `"name" (param: Type, ...) [ (val, ...), ... ] { body }`
+/// Parse: `"name" [labels(...)] (param: Type, ...) [ (val, ...), ... ] { body }`
 fn parse_describe_table(
     input: ParseStream,
     focused: bool,
     pending: bool,
 ) -> Result<DescribeTableBlock> {
     let name: LitStr = input.parse()?;
+    let labels = parse_optional_labels(input)?;
 
     // Parse parameter declarations: (a: Type, b: Type, ...)
     let params_content;
@@ -331,15 +363,17 @@ fn parse_describe_table(
         name,
         focused,
         pending,
+        labels,
         params,
         entries,
         body,
     })
 }
 
-/// Parse: `"name" [continue_on_failure] { items... }`
+/// Parse: `"name" [labels(...)] [continue_on_failure] { items... }`
 fn parse_ordered_block(input: ParseStream) -> Result<OrderedBlock> {
     let name: LitStr = input.parse()?;
+    let labels = parse_optional_labels(input)?;
 
     // Check for optional `continue_on_failure` keyword before the brace
     let continue_on_failure = if input.peek(Ident) {
@@ -361,6 +395,7 @@ fn parse_ordered_block(input: ParseStream) -> Result<OrderedBlock> {
     let items = parse_items(&content)?;
     Ok(OrderedBlock {
         name,
+        labels,
         continue_on_failure,
         items,
     })
