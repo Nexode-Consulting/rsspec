@@ -11,10 +11,17 @@ description = "A Ginkgo/RSpec-inspired BDD testing framework for Rust."
 [features]
 default = []
 googletest = ["dep:googletest"]
+tokio = ["dep:tokio"]
 
 [dependencies]
 googletest = { version = "0.14", optional = true }
+tokio = { version = "1", features = ["rt"], optional = true }
 
 [[test]]
 name = "closure_api_test"
 harness = false
+
+[[test]]
+name = "async_test"
+harness = false
+required-features = ["tokio"]

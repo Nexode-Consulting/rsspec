@@ -274,8 +274,38 @@ pub(crate) struct RunConfig {
     pub include_ignored: bool,
 }
 
+/// Args that are exclusively used by libtest (cargo test's built-in harness).
+/// If we see any of these, `rsspec::run()` is almost certainly being called
+/// inside a `#[test]` function instead of a `harness = false` binary.
+const LIBTEST_ONLY_ARGS: &[&str] = &[
+    "--format",
+    "--test-threads",
+    "--logfile",
+    "--report-time",
+    "--ensure-time",
+    "--shuffle-seed",
+    "--show-output",
+    "-Zunstable-options",
+];
+
+/// Check if a list of CLI args contains libtest-specific arguments.
+///
+/// Returns `Some(arg)` with the first offending arg if detected, `None` otherwise.
+pub(crate) fn detect_libtest_args(args: &[String]) -> Option<String> {
+    for arg in args {
+        let arg_name = arg.split('=').next().unwrap_or(arg);
+        if LIBTEST_ONLY_ARGS.contains(&arg_name) {
+            return Some(arg.clone());
+        }
+    }
+    None
+}
+
 impl RunConfig {
     /// Parse from the process args (compatible with `cargo test -- <args>`).
+    ///
+    /// Only use this for `harness = false` targets. For `#[test]` functions,
+    /// `run()` auto-detects the context and skips arg parsing.
     pub(crate) fn from_args() -> Self {
         let args: Vec<String> = std::env::args().collect();
         let mut filter = None;
@@ -381,6 +411,113 @@ pub(crate) fn run_suites(suites: &[Suite], config: &RunConfig) -> RunResult {
     result
 }
 
+/// Check if any tests in this subtree will actually execute, considering
+/// focus mode, label filters, path filters, and pending status.
+///
+/// Used to skip `before_all`/`after_all` when all children are filtered out.
+#[allow(clippy::too_many_arguments)]
+fn has_runnable_tests(
+    nodes: &[TestNode],
+    path: &[String],
+    hooks: &HookChain,
+    focus_mode: bool,
+    force_focused: bool,
+    config: &RunConfig,
+) -> bool {
+    for node in nodes {
+        match node {
+            TestNode::Describe {
+                name,
+                focused,
+                pending,
+                children,
+                ..
+            } => {
+                if *pending {
+                    continue;
+                }
+                let mut child_path = path.to_vec();
+                child_path.push(name.clone());
+                let child_hooks = hooks.with_describe(node);
+                let child_force_focused = force_focused || *focused;
+                if has_runnable_tests(
+                    children,
+                    &child_path,
+                    &child_hooks,
+                    focus_mode,
+                    child_force_focused,
+                    config,
+                ) {
+                    return true;
+                }
+            }
+            TestNode::It {
+                name,
+                focused,
+                pending,
+                labels,
+                ..
+            } => {
+                if *pending {
+                    continue;
+                }
+                let full_path = {
+                    let mut p = path.to_vec();
+                    p.push(name.clone());
+                    p.join(" > ")
+                };
+                if let Some(ref f) = config.filter {
+                    if !full_path.to_lowercase().contains(&f.to_lowercase()) {
+                        continue;
+                    }
+                }
+                let effectively_focused = *focused || force_focused;
+                if focus_mode && !effectively_focused && !config.include_ignored {
+                    continue;
+                }
+                let all_labels: Vec<&str> = hooks
+                    .labels
+                    .iter()
+                    .copied()
+                    .chain(labels.iter().map(|s| s.as_str()))
+                    .collect();
+                if !crate::check_labels(&all_labels) {
+                    continue;
+                }
+                return true;
+            }
+            TestNode::Ordered {
+                name, labels, ..
+            } => {
+                let full_path = {
+                    let mut p = path.to_vec();
+                    p.push(name.clone());
+                    p.join(" > ")
+                };
+                if let Some(ref f) = config.filter {
+                    if !full_path.to_lowercase().contains(&f.to_lowercase()) {
+                        continue;
+                    }
+                }
+                if focus_mode && !force_focused && !config.include_ignored {
+                    continue;
+                }
+                let all_labels: Vec<&str> = hooks
+                    .labels
+                    .iter()
+                    .copied()
+                    .chain(labels.iter().map(|s| s.as_str()))
+                    .collect();
+                if !crate::check_labels(&all_labels) {
+                    continue;
+                }
+                return true;
+            }
+        }
+    }
+    false
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_nodes(
     nodes: &[TestNode],
@@ -432,6 +569,35 @@ fn run_node(
 
             let child_hooks = hooks.with_describe(node);
             let child_force_focused = force_focused || *focused;
+
+            // Skip before_all/after_all when no children will actually run
+            // (e.g. all filtered by labels or focus mode). This avoids running
+            // expensive setup for nothing.
+            let any_runnable = has_runnable_tests(
+                children,
+                &child_path,
+                &child_hooks,
+                focus_mode,
+                child_force_focused,
+                config,
+            );
+            let has_hooks = !before_all.is_empty() || !after_all.is_empty();
+
+            if !any_runnable && has_hooks {
+                // Still recurse children so pending/skipped counts are correct,
+                // but skip the before_all/after_all hooks.
+                run_nodes(
+                    children,
+                    depth + 1,
+                    &child_path,
+                    &child_hooks,
+                    focus_mode,
+                    child_force_focused,
+                    config,
+                    result,
+                );
+                return;
+            }
 
             // Run before_all once at scope entry.
             // If it panics, skip children but still run after_all.
@@ -660,9 +826,10 @@ fn run_node(
                     }
 
                     let mut failures: Vec<Box<dyn std::any::Any + Send>> = Vec::new();
+                    let total = steps.len();
 
-                    for step in steps {
-                        crate::by(&step.name);
+                    for (i, step) in steps.iter().enumerate() {
+                        eprintln!("  [{}/{}] {}", i + 1, total, step.name);
                         if *continue_on_failure {
                             if let Err(e) = catch_unwind(AssertUnwindSafe(|| (step.body)())) {
                                 failures.push(e);
@@ -798,7 +965,7 @@ fn run_with_timeout(
 fn print_summary(result: &RunResult, elapsed: std::time::Duration) {
     let elapsed_str = format!("{:.3}s", elapsed.as_secs_f64());
 
-    let parts: Vec<String> = [
+    let mut parts: Vec<String> = [
         (result.passed > 0).then(|| green(&format!("{} passed", result.passed))),
         (result.failed > 0).then(|| red(&format!("{} failed", result.failed))),
         (result.pending > 0).then(|| yellow(&format!("{} pending", result.pending))),
@@ -807,6 +974,11 @@ fn print_summary(result: &RunResult, elapsed: std::time::Duration) {
     .into_iter()
     .flatten()
     .collect();
+
+    // Avoid an empty summary line when all tests are filtered out
+    if parts.is_empty() {
+        parts.push(dim("0 matched"));
+    }
 
     let summary = format!("{} ({})", parts.join(", "), dim(&elapsed_str));
 
@@ -1185,5 +1357,39 @@ mod tests {
         assert_eq!(ATTEMPTS.load(Ordering::SeqCst), 3);
         assert_eq!(result.failed, 0);
         assert_eq!(result.passed, 1);
+    }
+
+    // ---- detect_libtest_args regression tests ----
+
+    fn args(strs: &[&str]) -> Vec<String> {
+        strs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn detect_libtest_args_catches_format() {
+        assert!(detect_libtest_args(&args(&["--format=json"])).is_some());
+        assert!(detect_libtest_args(&args(&["--format=pretty"])).is_some());
+        assert!(detect_libtest_args(&args(&["--format", "json"])).is_some());
+    }
+
+    #[test]
+    fn detect_libtest_args_catches_test_threads() {
+        assert!(detect_libtest_args(&args(&["--test-threads=4"])).is_some());
+        assert!(detect_libtest_args(&args(&["--test-threads", "2"])).is_some());
+    }
+
+    #[test]
+    fn detect_libtest_args_catches_other_libtest_flags() {
+        assert!(detect_libtest_args(&args(&["--show-output"])).is_some());
+        assert!(detect_libtest_args(&args(&["--logfile", "out.log"])).is_some());
+        assert!(detect_libtest_args(&args(&["-Zunstable-options"])).is_some());
+    }
+
+    #[test]
+    fn detect_libtest_args_ignores_rsspec_args() {
+        assert!(detect_libtest_args(&args(&["--list"])).is_none());
+        assert!(detect_libtest_args(&args(&["--include-ignored"])).is_none());
+        assert!(detect_libtest_args(&args(&["my_filter"])).is_none());
+        assert!(detect_libtest_args(&args(&[])).is_none());
     }
 }

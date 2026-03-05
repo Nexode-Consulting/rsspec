@@ -10,7 +10,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dev-dependencies]
-rsspec = "0.2"
+rsspec = "0.4"
 
 [[test]]
 name = "my_tests"
@@ -51,14 +51,14 @@ PASS
 
 ### Using with `#[test]` functions
 
-If you want to embed rsspec specs inside regular `#[test]` functions (no `harness = false` needed), use `run_inline`:
+`rsspec::run()` auto-detects when it's running inside cargo test's harness and adapts: it skips CLI arg parsing and panics on failure instead of calling `process::exit`.
 
 ```rust
 #[cfg(test)]
 mod tests {
     #[test]
     fn calculator_spec() {
-        rsspec::run_inline(|ctx| {
+        rsspec::run(|ctx| {
             ctx.describe("Calculator", |ctx| {
                 ctx.it("adds", || { assert_eq!(2 + 3, 5); });
             });
@@ -67,7 +67,9 @@ mod tests {
 }
 ```
 
-`run_inline` does not parse command-line args (avoiding conflicts with `cargo test`'s own filters) and panics on failure instead of calling `process::exit`.
+`run_inline()` is also available as an explicit alternative that never parses CLI args.
+
+> **Note:** When using `#[test]` mode, the BDD tree output goes to stderr (which cargo test captures by default). Add `--show-output` or `--nocapture` to see it: `cargo test -- --show-output`
 
 ## API Reference
 
@@ -121,6 +123,8 @@ ctx.specify("also works", || {
 
 **Focus**: `fit`, `fspecify` — **Pending**: `xit`, `xspecify`
 
+> **Note:** Test closures must be `Fn()` (not `FnOnce`) to support retries and `must_pass_repeatedly`. If you need to move a non-Copy value into a test closure, wrap it in an `Rc` or use `clone()`.
+
 ### Lifecycle Hooks
 
 | Hook | Runs | Scope |
@@ -128,8 +132,8 @@ ctx.specify("also works", || {
 | `before_each` | Before every `it` | Inherited by nested scopes |
 | `just_before_each` | After all `before_each`, right before the body | Inherited |
 | `after_each` | After every `it` (even on panic) | Inherited |
-| `before_all` | Once before all tests in scope | Per describe |
-| `after_all` | Once after all tests in scope | Per describe |
+| `before_all` | Once before all tests in scope | Per describe (not inherited) |
+| `after_all` | Once after all tests in scope | Per describe (not inherited) |
 
 ```rust
 ctx.describe("database tests", |ctx| {
@@ -161,6 +165,14 @@ Execution order per test:
 before_all (once) -> before_each -> just_before_each -> body -> after_each -> after_all (once)
 ```
 
+**Hook details:**
+
+- **Inheritance:** `before_each`, `after_each`, and `just_before_each` are inherited by nested `describe`/`context` blocks. `before_all` and `after_all` only run in the scope where they are defined.
+- **Ordering:** `before_each` hooks run outer-to-inner. `after_each` hooks run inner-to-outer. Both are guaranteed to run even if a prior hook or the test body panics.
+- **Multiple hooks:** You can register multiple hooks of the same type in the same scope. They all run in registration order.
+- **Ordered tests:** `before_each` and `after_each` from parent describes wrap the *entire* ordered sequence, not each individual step.
+- **Filtering optimization:** `before_all`/`after_all` are skipped when all children in a scope are filtered out (by labels or focus mode), avoiding unnecessary setup.
+
 ### Decorators
 
 Attach metadata to `it` blocks using the fluent builder API:
@@ -188,9 +200,17 @@ ctx.it("everything", || { /* ... */ })
     .timeout(5000);
 ```
 
+**Decorator details:**
+
+- **`.labels()`** accumulates across multiple calls: `.labels(&["a"]).labels(&["b"])` results in labels `["a", "b"]`.
+- **`.retries(n)`** retries the test up to `n` additional times on failure. `retries(0)` means no retries (same as default).
+- **`.must_pass_repeatedly(n)`** requires the test to pass `n` consecutive times. `n` must be >= 1.
+- **`.timeout(ms)`** fails the test if it exceeds `ms` milliseconds. **Important:** The timeout is checked *after* the closure returns — it cannot abort a running test. If your test deadlocks or enters an infinite loop, the timeout will not fire. Use OS-level timeouts (e.g. CI job timeouts) as a safety net.
+- **Composition order:** When combined, decorators apply as `timeout(must_pass_repeatedly(retries(body)))`. The timeout wraps the entire retry+must_pass cycle, not individual attempts.
+
 ### Describe-Level Labels
 
-Set labels on a describe scope — they propagate to all child tests:
+Add labels to a describe scope — they propagate to all child tests:
 
 ```rust
 ctx.describe("integration tests", |ctx| {
@@ -199,6 +219,8 @@ ctx.describe("integration tests", |ctx| {
     ctx.it("inherits labels", || { /* ... */ });
 });
 ```
+
+Labels accumulate: calling `ctx.labels()` multiple times adds to the existing set.
 
 ### Table-Driven Tests
 
@@ -216,6 +238,20 @@ ctx.describe_table("arithmetic")
 
 Each case becomes a separate test.
 
+Use `case_unnamed` for auto-named cases (`case_1`, `case_2`, ...):
+
+```rust
+ctx.describe_table("squares")
+    .case_unnamed((2i32, 4i32))
+    .case_unnamed((3, 9))
+    .case_unnamed((4, 16))
+    .run(|(input, expected): &(i32, i32)| {
+        assert_eq!(input * input, *expected);
+    });
+```
+
+> **Type safety:** The first `.case()` call fixes the data type `T` for all subsequent cases. Mixing types is a compile-time error. Always annotate the first case's type explicitly (e.g. `2i32` not `2`) to avoid Rust's default integer inference.
+
 ### Ordered Tests
 
 Sequential, fail-fast test workflows:
@@ -231,7 +267,7 @@ ctx.ordered("user registration", |oct| {
 });
 ```
 
-All steps run in sequence. If any step fails, subsequent steps are skipped.
+All steps run in sequence. If any step fails, subsequent steps are skipped. Steps are numbered in the output (e.g. `[1/2] create account`).
 
 Use `ordered_continue_on_failure` to run all steps regardless:
 
@@ -241,6 +277,103 @@ ctx.ordered_continue_on_failure("resilient workflow", |oct| {
     oct.step("step 2", || { /* runs even if step 1 fails */ });
 });
 ```
+
+## Async Tests
+
+Enable the `tokio` feature for async test support:
+
+```toml
+[dev-dependencies]
+rsspec = { version = "0.4", features = ["tokio"] }
+tokio = { version = "1", features = ["full"] }
+```
+
+Write async tests with `async_it`:
+
+```rust
+ctx.describe("API client", |ctx| {
+    ctx.async_it("fetches data", || async {
+        let data = fetch_data().await;
+        assert!(!data.is_empty());
+    });
+});
+```
+
+All decorators work with async tests:
+
+```rust
+ctx.async_it("flaky network call", || async {
+    let resp = call_api().await;
+    assert!(resp.is_ok());
+})
+.retries(3)
+.timeout(5000)
+.labels(&["integration"]);
+```
+
+Async hooks:
+
+```rust
+ctx.describe("with async setup", |ctx| {
+    ctx.async_before_each(|| async {
+        setup_database().await;
+    });
+
+    ctx.async_after_each(|| async {
+        cleanup_database().await;
+    });
+
+    ctx.async_it("uses the database", || async {
+        let rows = query("SELECT 1").await;
+        assert_eq!(rows.len(), 1);
+    });
+});
+```
+
+Async ordered steps and table-driven tests:
+
+```rust
+ctx.ordered("async workflow", |oct| {
+    oct.async_step("create resource", || async { create().await; });
+    oct.async_step("verify resource", || async { verify().await; });
+});
+
+ctx.describe_table("async endpoints")
+    .case("users", "/api/users".to_string())
+    .case("posts", "/api/posts".to_string())
+    .async_run(|endpoint: &String| {
+        let url = endpoint.clone();
+        async move {
+            let resp = reqwest::get(&url).await.unwrap();
+            assert!(resp.status().is_success());
+        }
+    });
+```
+
+You can also use `rsspec::async_test()` directly to wrap any async closure:
+
+```rust
+ctx.it("manual async", rsspec::async_test(|| async {
+    assert!(true);
+}));
+```
+
+| Sync | Async |
+| --- | --- |
+| `it` / `fit` / `xit` | `async_it` / `async_fit` / `async_xit` |
+| `specify` / `fspecify` / `xspecify` | `async_specify` / `async_fspecify` / `async_xspecify` |
+| `before_each` / `after_each` | `async_before_each` / `async_after_each` |
+| `before_all` / `after_all` | `async_before_all` / `async_after_all` |
+| `just_before_each` | `async_just_before_each` |
+| `step` (ordered) | `async_step` |
+| `run` (table) | `async_run` |
+
+**Async runtime details:**
+
+- Each async test/hook gets a fresh **single-threaded** Tokio runtime (`new_current_thread`). This prevents cross-test state leakage and works correctly with retries.
+- `tokio::spawn()` works but runs on the same thread — there is no multi-threaded parallelism within a single test.
+- **Do not create a nested Tokio runtime** inside an async test. Calling `Runtime::new()` inside an `async_it` block will panic with "Cannot start a runtime from within a runtime."
+- The `|| async { ... }` pattern (closure returning a future) is required because Rust's `async Fn()` trait is not yet stable.
 
 ## Runtime Helpers
 
@@ -256,6 +389,8 @@ ctx.it("creates temp resources", || {
 });
 ```
 
+> **Note:** `defer_cleanup` uses a thread-local stack. Calling it from a `std::thread::spawn`ed thread inside a test will register the cleanup on the wrong thread. Keep cleanup registrations on the test thread.
+
 ### by
 
 Document steps within a test:
@@ -270,6 +405,8 @@ ctx.it("complex workflow", || {
     assert!(true);
 });
 ```
+
+Each step prints `STEP: description` to stderr.
 
 ### skip!
 
@@ -292,13 +429,123 @@ ctx.it("requires a database", || {
 | `RSSPEC_FAIL_ON_FOCUS` | Set to `1` or `true` to fail when focused tests exist (CI safety) |
 | `NO_COLOR` | Disable colored output |
 
+## Shared State Patterns
+
+Since hooks and tests use `Fn() + 'static` closures, sharing mutable state requires thread-safe types. Here are the recommended patterns:
+
+### Static atomics (simple counters/flags)
+
+```rust
+use std::sync::atomic::{AtomicU32, Ordering};
+
+ctx.describe("with counter", |ctx| {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    ctx.before_each(|| {
+        COUNTER.fetch_add(1, Ordering::SeqCst);
+    });
+
+    ctx.it("counter incremented", || {
+        assert!(COUNTER.load(Ordering::SeqCst) >= 1);
+    });
+});
+```
+
+### OnceLock (expensive one-time setup)
+
+```rust
+use std::sync::OnceLock;
+
+ctx.describe("with shared resource", |ctx| {
+    static POOL: OnceLock<DbPool> = OnceLock::new();
+
+    ctx.before_all(|| {
+        POOL.set(create_pool()).unwrap();
+    });
+
+    ctx.it("uses the pool", || {
+        let pool = POOL.get().unwrap();
+        // ... use pool ...
+    });
+});
+```
+
+## CI Integration
+
+### GitHub Actions example
+
+```yaml
+- name: Run tests
+  env:
+    RSSPEC_FAIL_ON_FOCUS: "1"  # Fail if any fit/fdescribe slipped through
+    NO_COLOR: "1"               # Clean CI logs
+  run: cargo test
+
+- name: Run integration tests only
+  env:
+    RSSPEC_LABEL_FILTER: "integration"
+  run: cargo test
+```
+
+### Splitting test stages with labels
+
+```rust
+ctx.describe("API", |ctx| {
+    ctx.labels(&["integration"]);
+    // These only run when RSSPEC_LABEL_FILTER includes "integration"
+    ctx.it("creates users", || { /* ... */ });
+});
+
+ctx.describe("Utils", |ctx| {
+    ctx.labels(&["unit"]);
+    // These only run when RSSPEC_LABEL_FILTER includes "unit"
+    ctx.it("parses input", || { /* ... */ });
+});
+```
+
+Then in CI:
+
+```bash
+RSSPEC_LABEL_FILTER=unit cargo test          # Fast PR checks
+RSSPEC_LABEL_FILTER=integration cargo test   # Nightly / staging
+```
+
+## Migrating from `#[test]`
+
+rsspec can coexist with standard `#[test]` functions. Migrate incrementally:
+
+1. **Start with `#[test]` + `rsspec::run()`** — no `Cargo.toml` changes needed:
+
+   ```rust
+   #[test]
+   fn user_api_spec() {
+       rsspec::run(|ctx| {
+           ctx.describe("User API", |ctx| {
+               ctx.it("creates users", || { /* ... */ });
+           });
+       });
+   }
+   ```
+
+2. **When you want full BDD output**, add a `[[test]]` entry with `harness = false`:
+
+   ```toml
+   [[test]]
+   name = "user_api"
+   harness = false
+   ```
+
+   Then change the test file to use `fn main()` instead of `#[test]`.
+
+3. **Keep unit tests as `#[test]`** — rsspec is most valuable for integration and acceptance tests where nesting, hooks, and lifecycle management matter.
+
 ## googletest Integration
 
 Enable the `googletest` feature for composable matchers:
 
 ```toml
 [dev-dependencies]
-rsspec = { version = "0.2", features = ["googletest"] }
+rsspec = { version = "0.4", features = ["googletest"] }
 ```
 
 ```rust

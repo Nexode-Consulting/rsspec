@@ -24,6 +24,7 @@
 //! ## Features
 //!
 //! - `googletest` — re-exports `googletest` matchers via `rsspec::matchers`
+//! - `tokio` — async test support via `async_it`, `async_before_each`, etc.
 
 pub(crate) mod runner;
 mod context;
@@ -40,6 +41,38 @@ pub use googletest;
 #[cfg(feature = "googletest")]
 pub mod matchers {
     pub use googletest::prelude::*;
+}
+
+// ============================================================================
+// Async test support (requires `tokio` feature)
+// ============================================================================
+
+/// Wrap an async closure into a synchronous `Fn()` for use with rsspec.
+///
+/// Creates a fresh single-threaded Tokio runtime per invocation, preventing
+/// cross-test state leakage and working correctly with retries.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// ctx.it("async test", rsspec::async_test(|| async {
+///     let value = fetch().await;
+///     assert_eq!(value, 42);
+/// }));
+/// ```
+#[cfg(feature = "tokio")]
+pub fn async_test<F, Fut>(f: F) -> impl Fn() + 'static
+where
+    F: Fn() -> Fut + 'static,
+    Fut: std::future::Future<Output = ()> + 'static,
+{
+    move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rsspec: failed to build Tokio runtime");
+        rt.block_on(f());
+    }
 }
 
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
@@ -73,6 +106,7 @@ pub struct Guard<F: FnOnce()> {
 }
 
 impl<F: FnOnce()> Guard<F> {
+    /// Create a new guard that runs `f` when dropped.
     pub fn new(f: F) -> Self {
         Guard { f: Some(f) }
     }
@@ -185,7 +219,10 @@ pub(crate) fn with_retries(retries: u32, f: impl Fn()) {
 }
 
 /// Require a test to pass `n` consecutive times.
+///
+/// Panics if `n` is 0 (would be a no-op that always passes).
 pub(crate) fn must_pass_repeatedly(n: u32, f: impl Fn()) {
+    assert!(n > 0, "rsspec: must_pass_repeatedly requires n >= 1");
     for attempt in 1..=n {
         if let Err(e) = catch_unwind(AssertUnwindSafe(&f)) {
             eprintln!("  must_pass_repeatedly: failed on attempt {attempt}/{n}");

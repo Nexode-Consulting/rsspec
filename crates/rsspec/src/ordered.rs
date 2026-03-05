@@ -40,9 +40,21 @@ impl OrderedContext {
         });
     }
 
-    /// Set labels on this ordered test.
+    /// Add labels to this ordered test. Labels accumulate across multiple calls.
     pub fn labels(&mut self, labels: &[&str]) {
-        self.labels = labels.iter().map(|s| s.to_string()).collect();
+        self.labels.extend(labels.iter().map(|s| s.to_string()));
+    }
+
+    /// Add an async step to the ordered sequence.
+    ///
+    /// Available with the `tokio` feature.
+    #[cfg(feature = "tokio")]
+    pub fn async_step<F, Fut>(&mut self, name: &str, body: F)
+    where
+        F: Fn() -> Fut + 'static,
+        Fut: std::future::Future<Output = ()> + 'static,
+    {
+        self.step(name, crate::async_test(body));
     }
 
     pub(crate) fn into_node(self) -> TestNode {

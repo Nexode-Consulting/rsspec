@@ -108,8 +108,8 @@ impl SuiteBuilder {
         self.current_frame_mut().just_before_each.push(hook);
     }
 
-    fn set_labels(&mut self, labels: Vec<String>) {
-        self.current_frame_mut().labels = labels;
+    fn add_labels(&mut self, labels: Vec<String>) {
+        self.current_frame_mut().labels.extend(labels);
     }
 
     fn current_frame_mut(&mut self) -> &mut GroupFrame {
@@ -160,38 +160,49 @@ pub struct Context;
 impl Context {
     // ---- Describe / Context / When -------------------------------------------
 
+    /// Define a named group of tests. Alias: [`context`](Self::context), [`when`](Self::when).
     pub fn describe(&self, name: &str, body: impl FnOnce(Context)) {
         self.describe_impl(name, false, false, body);
     }
 
+    /// Focused variant of [`describe`](Self::describe). Only focused groups and their
+    /// children run; all other tests are skipped.
     pub fn fdescribe(&self, name: &str, body: impl FnOnce(Context)) {
         self.describe_impl(name, true, false, body);
     }
 
+    /// Pending variant of [`describe`](Self::describe). All children are marked pending
+    /// and their bodies never execute.
     pub fn xdescribe(&self, name: &str, body: impl FnOnce(Context)) {
         self.describe_impl(name, false, true, body);
     }
 
+    /// Alias for [`describe`](Self::describe).
     pub fn context(&self, name: &str, body: impl FnOnce(Context)) {
         self.describe(name, body);
     }
 
+    /// Alias for [`fdescribe`](Self::fdescribe).
     pub fn fcontext(&self, name: &str, body: impl FnOnce(Context)) {
         self.fdescribe(name, body);
     }
 
+    /// Alias for [`xdescribe`](Self::xdescribe).
     pub fn xcontext(&self, name: &str, body: impl FnOnce(Context)) {
         self.xdescribe(name, body);
     }
 
+    /// Alias for [`describe`](Self::describe).
     pub fn when(&self, name: &str, body: impl FnOnce(Context)) {
         self.describe(name, body);
     }
 
+    /// Alias for [`fdescribe`](Self::fdescribe).
     pub fn fwhen(&self, name: &str, body: impl FnOnce(Context)) {
         self.fdescribe(name, body);
     }
 
+    /// Alias for [`xdescribe`](Self::xdescribe).
     pub fn xwhen(&self, name: &str, body: impl FnOnce(Context)) {
         self.xdescribe(name, body);
     }
@@ -220,51 +231,67 @@ impl Context {
         ItBuilder::new(name.to_string(), body, false, false)
     }
 
+    /// Focused variant of [`it`](Self::it). Only focused tests run; others are skipped.
     pub fn fit(&self, name: &str, body: impl Fn() + 'static) -> ItBuilder {
         ItBuilder::new(name.to_string(), body, true, false)
     }
 
+    /// Pending variant of [`it`](Self::it). The body is registered but never executed.
     pub fn xit(&self, name: &str, body: impl Fn() + 'static) -> ItBuilder {
         ItBuilder::new(name.to_string(), body, false, true)
     }
 
+    /// Alias for [`it`](Self::it).
     pub fn specify(&self, name: &str, body: impl Fn() + 'static) -> ItBuilder {
         self.it(name, body)
     }
 
+    /// Alias for [`fit`](Self::fit).
     pub fn fspecify(&self, name: &str, body: impl Fn() + 'static) -> ItBuilder {
         self.fit(name, body)
     }
 
+    /// Alias for [`xit`](Self::xit).
     pub fn xspecify(&self, name: &str, body: impl Fn() + 'static) -> ItBuilder {
         self.xit(name, body)
     }
 
     // ---- Hooks ---------------------------------------------------------------
 
+    /// Register a hook that runs before every test in this scope and nested scopes.
+    /// Multiple `before_each` hooks in the same scope run in registration order.
     pub fn before_each(&self, hook: impl Fn() + 'static) {
         with_builder(|b| b.add_before_each(Box::new(hook)));
     }
 
+    /// Register a hook that runs after every test in this scope and nested scopes,
+    /// even if the test panics. Multiple `after_each` hooks run inner-to-outer.
     pub fn after_each(&self, hook: impl Fn() + 'static) {
         with_builder(|b| b.add_after_each(Box::new(hook)));
     }
 
+    /// Register a hook that runs once before all tests in this describe scope.
+    /// Not inherited by nested scopes. Skipped if all children are filtered out.
     pub fn before_all(&self, hook: impl Fn() + 'static) {
         with_builder(|b| b.add_before_all(Box::new(hook)));
     }
 
+    /// Register a hook that runs once after all tests in this describe scope.
+    /// Not inherited by nested scopes. Runs even if `before_all` panicked.
     pub fn after_all(&self, hook: impl Fn() + 'static) {
         with_builder(|b| b.add_after_all(Box::new(hook)));
     }
 
+    /// Register a hook that runs after all `before_each` hooks but immediately
+    /// before the test body. Useful for final setup that must run last.
     pub fn just_before_each(&self, hook: impl Fn() + 'static) {
         with_builder(|b| b.add_just_before_each(Box::new(hook)));
     }
 
     // ---- Labels on current describe ------------------------------------------
 
-    /// Set labels on the current describe scope.
+    /// Add labels to the current describe scope. Labels accumulate across
+    /// multiple calls.
     ///
     /// ```rust,no_run
     /// # fn main() { rsspec::run(|ctx| {
@@ -276,7 +303,7 @@ impl Context {
     /// ```
     pub fn labels(&self, labels: &[&str]) {
         let labels: Vec<String> = labels.iter().map(|s| s.to_string()).collect();
-        with_builder(|b| b.set_labels(labels));
+        with_builder(|b| b.add_labels(labels));
     }
 
     // ---- Table-driven --------------------------------------------------------
@@ -330,6 +357,130 @@ impl Context {
 }
 
 // ============================================================================
+// Async methods (requires `tokio` feature)
+// ============================================================================
+
+#[cfg(feature = "tokio")]
+impl Context {
+    // ---- Async It / Specify ---------------------------------------------------
+
+    /// Define an async test case. Returns an [`ItBuilder`] for optional decorators.
+    ///
+    /// ```rust,ignore
+    /// ctx.async_it("fetches data", || async {
+    ///     let data = fetch().await;
+    ///     assert!(!data.is_empty());
+    /// })
+    /// .retries(3)
+    /// .timeout(5000);
+    /// ```
+    pub fn async_it<F, Fut>(&self, name: &str, body: F) -> ItBuilder
+    where
+        F: Fn() -> Fut + 'static,
+        Fut: std::future::Future<Output = ()> + 'static,
+    {
+        self.it(name, crate::async_test(body))
+    }
+
+    /// Focused variant of [`async_it`](Self::async_it).
+    pub fn async_fit<F, Fut>(&self, name: &str, body: F) -> ItBuilder
+    where
+        F: Fn() -> Fut + 'static,
+        Fut: std::future::Future<Output = ()> + 'static,
+    {
+        self.fit(name, crate::async_test(body))
+    }
+
+    /// Pending variant of [`async_it`](Self::async_it).
+    pub fn async_xit<F, Fut>(&self, name: &str, body: F) -> ItBuilder
+    where
+        F: Fn() -> Fut + 'static,
+        Fut: std::future::Future<Output = ()> + 'static,
+    {
+        self.xit(name, crate::async_test(body))
+    }
+
+    /// Alias for [`async_it`](Self::async_it).
+    pub fn async_specify<F, Fut>(&self, name: &str, body: F) -> ItBuilder
+    where
+        F: Fn() -> Fut + 'static,
+        Fut: std::future::Future<Output = ()> + 'static,
+    {
+        self.async_it(name, body)
+    }
+
+    /// Alias for [`async_fit`](Self::async_fit).
+    pub fn async_fspecify<F, Fut>(&self, name: &str, body: F) -> ItBuilder
+    where
+        F: Fn() -> Fut + 'static,
+        Fut: std::future::Future<Output = ()> + 'static,
+    {
+        self.async_fit(name, body)
+    }
+
+    /// Alias for [`async_xit`](Self::async_xit).
+    pub fn async_xspecify<F, Fut>(&self, name: &str, body: F) -> ItBuilder
+    where
+        F: Fn() -> Fut + 'static,
+        Fut: std::future::Future<Output = ()> + 'static,
+    {
+        self.async_xit(name, body)
+    }
+
+    // ---- Async Hooks ----------------------------------------------------------
+
+    /// Async variant of [`before_each`](Context::before_each).
+    /// Each invocation runs on a fresh single-threaded Tokio runtime.
+    pub fn async_before_each<F, Fut>(&self, hook: F)
+    where
+        F: Fn() -> Fut + 'static,
+        Fut: std::future::Future<Output = ()> + 'static,
+    {
+        self.before_each(crate::async_test(hook));
+    }
+
+    /// Async variant of [`after_each`](Context::after_each).
+    /// Each invocation runs on a fresh single-threaded Tokio runtime.
+    pub fn async_after_each<F, Fut>(&self, hook: F)
+    where
+        F: Fn() -> Fut + 'static,
+        Fut: std::future::Future<Output = ()> + 'static,
+    {
+        self.after_each(crate::async_test(hook));
+    }
+
+    /// Async variant of [`before_all`](Context::before_all).
+    /// Runs on a fresh single-threaded Tokio runtime.
+    pub fn async_before_all<F, Fut>(&self, hook: F)
+    where
+        F: Fn() -> Fut + 'static,
+        Fut: std::future::Future<Output = ()> + 'static,
+    {
+        self.before_all(crate::async_test(hook));
+    }
+
+    /// Async variant of [`after_all`](Context::after_all).
+    /// Runs on a fresh single-threaded Tokio runtime.
+    pub fn async_after_all<F, Fut>(&self, hook: F)
+    where
+        F: Fn() -> Fut + 'static,
+        Fut: std::future::Future<Output = ()> + 'static,
+    {
+        self.after_all(crate::async_test(hook));
+    }
+
+    /// Async variant of [`just_before_each`](Context::just_before_each).
+    /// Each invocation runs on a fresh single-threaded Tokio runtime.
+    pub fn async_just_before_each<F, Fut>(&self, hook: F)
+    where
+        F: Fn() -> Fut + 'static,
+        Fut: std::future::Future<Output = ()> + 'static,
+    {
+        self.just_before_each(crate::async_test(hook));
+    }
+}
+
+// ============================================================================
 // ItBuilder — fluent decorator API, registers test on Drop
 // ============================================================================
 
@@ -373,9 +524,10 @@ impl ItBuilder {
         }
     }
 
-    /// Add labels for filtering via `RSSPEC_LABEL_FILTER`.
+    /// Add labels for filtering via `RSSPEC_LABEL_FILTER`. Labels accumulate
+    /// across multiple calls.
     pub fn labels(mut self, labels: &[&str]) -> Self {
-        self.labels = labels.iter().map(|s| s.to_string()).collect();
+        self.labels.extend(labels.iter().map(|s| s.to_string()));
         self
     }
 
@@ -446,11 +598,14 @@ fn build_tree(body: impl FnOnce(Context)) -> Vec<TestNode> {
     })
 }
 
-/// Build and run a BDD test suite from a `harness = false` test target.
+/// Build and run a BDD test suite.
 ///
-/// Parses command-line args for filtering/listing and calls
-/// [`std::process::exit`] on failure. **Do not use from `#[test]`
-/// functions** — use [`run_inline`] instead.
+/// Works in both contexts:
+///
+/// - **`harness = false`** — parses CLI args for filtering/listing, calls
+///   [`std::process::exit`] on failure.
+/// - **`#[test]` functions** — auto-detected via libtest-specific CLI args;
+///   skips arg parsing and panics on failure so other tests can still run.
 ///
 /// # Example
 ///
@@ -463,12 +618,41 @@ fn build_tree(body: impl FnOnce(Context)) -> Vec<TestNode> {
 /// ```
 pub fn run(body: impl FnOnce(Context)) {
     let nodes = build_tree(body);
-    let config = RunConfig::from_args();
+
+    // Auto-detect: are we inside cargo test's standard harness?
+    let args: Vec<String> = std::env::args().collect();
+    let inside_harness = runner::detect_libtest_args(&args[1..]).is_some();
+
+    let config = if inside_harness {
+        RunConfig {
+            filter: None,
+            list: false,
+            include_ignored: false,
+        }
+    } else {
+        RunConfig::from_args()
+    };
+
     let suite = Suite::new("", nodes);
     let result = runner::run_suites(&[suite], &config);
 
     if result.failed > 0 {
-        std::process::exit(1);
+        if inside_harness {
+            // Inside #[test]: panic so other test functions still run
+            let details = result
+                .failures
+                .iter()
+                .enumerate()
+                .map(|(i, f)| format!("  {}. {}", i + 1, f))
+                .collect::<Vec<_>>()
+                .join("\n");
+            panic!(
+                "rsspec: {} test(s) failed\n{}",
+                result.failed, details
+            );
+        } else {
+            std::process::exit(1);
+        }
     }
 }
 
